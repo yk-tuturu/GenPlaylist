@@ -18,7 +18,15 @@ sys.path.insert(0, str(WP_ROOT))
 
 from dataset import AbstractDataset  # noqa: E402
 from config_composition import compose_wp_c_config  # noqa: E402
-from genplaylist_tokenizer import GenPlaylistTokenizer  # noqa: E402
+from genplaylist_tokenizer import (  # noqa: E402
+    CUE_NULL_TOKEN,
+    HISTORY_CONDITIONS,
+    HISTORY_DONOR_FILE,
+    SEMANTIC_NULL_TOKEN,
+    GenPlaylistTokenizer,
+    history_group,
+    load_history_donors,
+)
 from prepared_data import (  # noqa: E402
     expected_split_counts,
     load_prepared_tokenized_dataset,
@@ -41,6 +49,8 @@ def _configure(args):
     config.cue_vocab_path = str(cue_dir / "cue_vocab.json")
     config.cue_manifest_path = str(cue_dir / "cue_manifest.json")
     config.active_cue_tokens = args.active_cues
+    config.history_condition = args.history_condition
+    config.prepared_dataset_path = str(args.prepared_dir.expanduser().resolve())
     config.model.length = FROZEN_NEXT_SONG_PROTOCOL.model_token_length(
         1 + TOKEN_LAYOUT.rq_n_codebooks + 1 + args.active_cues)
     return config
@@ -293,6 +303,125 @@ def _validate_vectors(
         "evaluation reference-target cosine")
 
 
+def _column_matrix(dataset, column: str, dtype=np.int64) -> np.ndarray:
+    values = dataset.with_format("numpy")[column]
+    array = np.asarray(values)
+    if array.dtype == object:
+        array = np.stack(values)
+    return array.astype(dtype)
+
+
+def _check_blocks(
+    name: str, blocks: np.ndarray, rows: np.ndarray, expected_cue_rows: np.ndarray | None,
+    *, null_semantic: bool, null_cues: bool, semantic_table: np.ndarray,
+    cue_table: np.ndarray,
+) -> None:
+    """Check ``[N, items, tokens_per_item]`` blocks against catalog tokens."""
+    semantic_end = 1 + TOKEN_LAYOUT.rq_n_codebooks + 1
+    if not np.all(blocks[:, :, 0] == TOKEN_LAYOUT.boi_token):
+        raise ValueError(f"{name}: an item block does not start with BOI")
+    semantic = blocks[:, :, 1:semantic_end]
+    cues = blocks[:, :, semantic_end:]
+    expected_semantic = (
+        np.full_like(semantic, SEMANTIC_NULL_TOKEN) if null_semantic
+        else semantic_table[rows])
+    if null_cues:
+        expected_cues = np.full_like(cues, CUE_NULL_TOKEN)
+    else:
+        expected_cues = cue_table[rows if expected_cue_rows is None else expected_cue_rows]
+    _assert_array_equal(semantic, expected_semantic, f"{name} RVQ/conflict tokens")
+    _assert_array_equal(cues, expected_cues, f"{name} cue tokens")
+
+
+def _validate_history_condition(
+    root: Path, dataset, tokenizer, tokenized, condition: str,
+) -> None:
+    """Independently re-derive every train/test row under the history ablation.
+
+    References must match the condition; train targets must always carry
+    real RVQ and cue tokens.
+    """
+    tokens_per_item = tokenizer.tokens_per_item
+    reference_items = FROZEN_NEXT_SONG_PROTOCOL.train_reference_items
+    target_items = FROZEN_NEXT_SONG_PROTOCOL.train_target_items
+    row_of = tokenizer.item_id_to_row
+    catalog_ids = [None] * len(row_of)
+    for item_id, row in row_of.items():
+        catalog_ids[row] = item_id
+    semantic_table = np.asarray(
+        [tokenizer.semantic_tokens[item_id] for item_id in catalog_ids], dtype=np.int64)
+    cue_table = np.asarray(
+        [[TOKEN_LAYOUT.cue_token(cue) for cue in tokenizer.item2cues[item_id]]
+         for item_id in catalog_ids], dtype=np.int64)
+    if condition == "latent_only" and np.any(cue_table == CUE_NULL_TOKEN):
+        raise ValueError("A real catalog cue equals the cue-null token; latent_only is ambiguous")
+
+    donor_payload = None
+    if condition == "shuffled_cue":
+        donor_path = root / HISTORY_DONOR_FILE
+        if not donor_path.is_file():
+            raise ValueError(f"shuffled_cue cache is missing {HISTORY_DONOR_FILE}")
+        donor_payload = json.loads(donor_path.read_text(encoding="utf-8"))["splits"]
+    elif (root / HISTORY_DONOR_FILE).exists():
+        raise ValueError(f"{condition} cache must not contain {HISTORY_DONOR_FILE}")
+
+    context_ids = np.load(root / "vectors" / "eval_context_input_ids.npy").astype(np.int64)
+    for split in ("train", "test"):
+        raw = dataset.split_data[split]
+        row_ids = [str(row_id) for row_id in raw["bundle"]]
+        sequences = raw["item_seq"]
+        item_rows = np.asarray(
+            [[row_of[str(item_id)] for item_id in sequence] for sequence in sequences],
+            dtype=np.int64)
+        reference_rows = item_rows[:, :reference_items]
+
+        donor_rows = None
+        if donor_payload is not None:
+            split_donors = donor_payload[split]
+            if set(split_donors) != set(row_ids):
+                raise ValueError(f"{split} donor map does not cover exactly the split rows")
+            position = {row_id: index for index, row_id in enumerate(row_ids)}
+            donor_indices = []
+            for row_id in row_ids:
+                entry = split_donors[row_id]
+                donor = entry["donor"]
+                if history_group(donor) == history_group(row_id):
+                    raise ValueError(f"{split} row {row_id} has a same-group donor {donor}")
+                donor_index = position[donor]
+                if list(entry["items"]) != [
+                        str(item_id) for item_id in sequences[donor_index][:reference_items]]:
+                    raise ValueError(f"{split} donor items for {row_id} differ from {donor}")
+                donor_indices.append(donor_index)
+            if len(set(donor_indices)) != len(donor_indices):
+                raise ValueError(f"{split} donor assignment is not a permutation")
+            donor_rows = reference_rows[np.asarray(donor_indices, dtype=np.int64)]
+
+        input_ids = _column_matrix(tokenized[split], "input_ids")
+        if split == "test":
+            _assert_array_equal(input_ids, context_ids, "test Arrow contexts vs vectors")
+        expected_items = reference_items + (target_items if split == "train" else 0)
+        expected_length = 2 + expected_items * tokens_per_item
+        if input_ids.shape != (len(row_ids), expected_length):
+            raise ValueError(f"{split} input shape drifted: {input_ids.shape}")
+        blocks = input_ids[:, 1:-1].reshape(len(row_ids), expected_items, tokens_per_item)
+        _check_blocks(
+            f"{split} references ({condition})", blocks[:, :reference_items],
+            reference_rows, donor_rows,
+            null_semantic=condition == "cue_only",
+            null_cues=condition == "latent_only",
+            semantic_table=semantic_table, cue_table=cue_table)
+        if split == "train":
+            _check_blocks(
+                f"{split} targets", blocks[:, reference_items:],
+                item_rows[:, reference_items:], None,
+                null_semantic=False, null_cues=False,
+                semantic_table=semantic_table, cue_table=cue_table)
+        if condition == "cue_only":
+            for column in ("mu_c", "context_emb"):
+                if np.any(_column_matrix(tokenized[split], column, np.float32) != 0.0):
+                    raise ValueError(f"{split} cue_only rows must zero {column}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
@@ -305,6 +434,9 @@ def main() -> int:
         "--active-cues", type=int, default=TOKEN_LAYOUT.cue_tokens,
         choices=(0, 4, 8, 16),
         help="Cue count used when this prepared dataset was built.")
+    parser.add_argument(
+        "--history-condition", default="full", choices=HISTORY_CONDITIONS,
+        help="History-condition ablation used when this prepared dataset was built.")
     args = parser.parse_args()
 
     root = args.prepared_dir.expanduser().resolve()
@@ -318,9 +450,11 @@ def main() -> int:
     _validate_output_hashes(root, manifest)
     _validate_arrow(root, dataset, tokenizer, tokenized, expected_counts)
     _validate_vectors(root, manifest, dataset, tokenizer, expected_counts)
+    _validate_history_condition(root, dataset, tokenizer, tokenized, args.history_condition)
     print(json.dumps({
         "status": "ok",
         "prepared_dir": str(root),
+        "history_condition": args.history_condition,
         "git_commit": manifest.get("git_commit"),
         "split_counts": manifest["split_counts"],
         "output_files_verified": len(manifest["outputs"]),

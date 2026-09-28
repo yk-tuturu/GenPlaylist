@@ -139,6 +139,17 @@ def validate_prepared_manifest(manifest: dict, config, tokenizer, dataset=None) 
     if manifest.get("token_layout") != expected_layout:
         raise ValueError(
             f"Prepared token layout mismatch: {manifest.get('token_layout')}")
+    configured_condition = str(config.get("history_condition", "full"))
+    prepared_condition = prepared_history_condition(manifest)
+    if prepared_condition != configured_condition:
+        raise ValueError(
+            f"Prepared history condition mismatch: prepared={prepared_condition!r} "
+            f"configured={configured_condition!r}")
+
+
+def prepared_history_condition(manifest: dict) -> str:
+    """Caches built before the conditioning ablation are all ``full``."""
+    return str(manifest.get("history_condition", {}).get("condition", "full"))
 
 
 def load_prepared_tokenized_dataset(root: str | Path, config, dataset, tokenizer):

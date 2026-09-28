@@ -21,6 +21,23 @@ EVAL_SEED="${GENPLAYLIST_EVAL_SEED:-1}"
 ALLOW_PROTOCOL_OVERRIDE="${GENPLAYLIST_EVAL_ALLOW_PROTOCOL_OVERRIDE:-false}"
 ACTIVE_CUES="${GENPLAYLIST_ACTIVE_CUES:-8}"
 STRUCTURE_CONDITIONING="${GENPLAYLIST_STRUCTURE_CONDITIONING:-false}"
+HISTORY_CONDITION="${GENPLAYLIST_HISTORY_CONDITION:-full}"
+# true only for diagnostics such as a Full checkpoint on shuffled_cue contexts.
+ALLOW_HISTORY_MISMATCH="${GENPLAYLIST_EVAL_ALLOW_HISTORY_MISMATCH:-false}"
+case "$HISTORY_CONDITION" in
+  full|latent_only|cue_only|shuffled_cue) ;;
+  *)
+    echo "GENPLAYLIST_HISTORY_CONDITION must be full, latent_only, cue_only, or shuffled_cue" >&2
+    exit 2
+    ;;
+esac
+case "$ALLOW_HISTORY_MISMATCH" in
+  true|false) ;;
+  *)
+    echo "GENPLAYLIST_EVAL_ALLOW_HISTORY_MISMATCH must be true or false" >&2
+    exit 2
+    ;;
+esac
 case "$ACTIVE_CUES" in
   0|4|8|16) ;;
   *)
@@ -47,9 +64,11 @@ if [[ -z "$EVAL_CKPT" ]]; then
   echo "GENPLAYLIST_EVAL_CKPT must point to the checkpoint to evaluate." >&2
   exit 2
 fi
+# Hydra changes into a fresh run directory, so relative paths would break.
+EVAL_CKPT="$(realpath "$EVAL_CKPT")"
 
 CKPT_LABEL="$(basename "$EVAL_CKPT" .ckpt)"
-RESULTS_PATH="${GENPLAYLIST_EVAL_RESULTS_PATH:-$RESULTS_ROOT/wp-c-${CKPT_LABEL}-${ACTIVE_CUES}cue-structure${STRUCTURE_CONDITIONING}-steps${SAMPLING_STEPS}-seed${EVAL_SEED}-${STAMP}.json}"
+RESULTS_PATH="${GENPLAYLIST_EVAL_RESULTS_PATH:-$RESULTS_ROOT/wp-c-${CKPT_LABEL}-${ACTIVE_CUES}cue-history-${HISTORY_CONDITION}-structure${STRUCTURE_CONDITIONING}-steps${SAMPLING_STEPS}-seed${EVAL_SEED}-${STAMP}.json}"
 
 for required in \
   "$EVAL_CKPT" \
@@ -86,9 +105,11 @@ python main.py \
   cue_manifest_path="$CUE_ROOT/cue_manifest.json" \
   prepared_dataset_path="$PREPARED_DATA_ROOT" \
   active_cue_tokens="$ACTIVE_CUES" \
+  history_condition="$HISTORY_CONDITION" \
   model.length="$MODEL_LENGTH" \
   sampling.structure_conditioning="$STRUCTURE_CONDITIONING" \
   eval.checkpoint_path="$EVAL_CKPT" \
+  eval.allow_history_condition_mismatch="$ALLOW_HISTORY_MISMATCH" \
   eval.results_path="$RESULTS_PATH" \
   eval.git_commit="$GIT_COMMIT" \
   eval.disable_ema=false \

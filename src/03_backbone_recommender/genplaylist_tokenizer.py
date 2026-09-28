@@ -30,6 +30,98 @@ from shared.artifacts import validate_catalog_alignment  # noqa: E402
 from shared.protocol import FROZEN_NEXT_SONG_PROTOCOL  # noqa: E402
 
 
+# Conditioning-channel ablation. Only the reference (history) items change;
+# every target item keeps its real RVQ and cue tokens.
+#   full          real RVQ/conflict tokens + real cues
+#   latent_only   real RVQ/conflict tokens, cues replaced by CUE_NULL_TOKEN
+#   cue_only      RVQ/conflict replaced by SEMANTIC_NULL_TOKEN, real cues
+#   shuffled_cue  real RVQ/conflict tokens, cues from a donor history of
+#                 another playlist/user (see build_history_donors)
+HISTORY_CONDITIONS = ("full", "latent_only", "cue_only", "shuffled_cue")
+# Cue ID 0 is <unk>; the frozen cue table never assigns it to a real item.
+CUE_NULL_TOKEN = TOKEN_LAYOUT.cue_token(0)
+# The padding/BOS token. The vocabulary has no spare IDs, and MASK would be
+# denoised by the sampler, so the existing padding token marks "no content".
+SEMANTIC_NULL_TOKEN = 0
+HISTORY_DONOR_FILE = "history_donors.json"
+HISTORY_DONOR_SCHEMA = "genplaylist-history-donors-v1"
+
+
+def history_group(row_id: str) -> str:
+    """Return the playlist (MPD) or user (Music4All) that produced a row.
+
+    MPD training rows are ``<playlist>:joint5:<start>`` rolling windows and
+    Music4All rows are ``m4a-<split>-<user pseudonym>-r....-s....``.
+    """
+    base = str(row_id).split(":joint5:", 1)[0]
+    if base.startswith("m4a-"):
+        parts = base.split("-")
+        if len(parts) < 3 or not parts[2]:
+            raise ValueError(f"Malformed Music4All row ID: {row_id!r}")
+        return parts[2]
+    return base
+
+
+def build_history_donors(
+    rows: list[tuple[str, list[str]]], *, reference_items: int, seed: int,
+    max_rounds: int = 1000,
+) -> dict[str, dict]:
+    """Assign every row a donor row from a different playlist/user.
+
+    The assignment is a seeded permutation, so every row donates its
+    reference cues exactly once. Returns ``{row_id: {"donor": donor_row_id,
+    "items": donor reference item IDs}}``.
+    """
+    if not rows:
+        return {}
+    row_ids = [str(row_id) for row_id, _ in rows]
+    if len(set(row_ids)) != len(row_ids):
+        raise ValueError("Donor assignment requires unique row IDs")
+    group_names = [history_group(row_id) for row_id in row_ids]
+    group_index = {name: index for index, name in enumerate(dict.fromkeys(group_names))}
+    if len(group_index) < 2:
+        raise ValueError("Donor assignment needs rows from at least two groups")
+    groups = np.asarray([group_index[name] for name in group_names], dtype=np.int64)
+    largest = int(np.bincount(groups).max())
+    if 2 * largest > len(rows):
+        raise ValueError(
+            f"A single playlist/user owns {largest} of {len(rows)} rows; no "
+            "cross-group donor permutation exists")
+
+    rng = np.random.default_rng(seed)
+    donors = rng.permutation(len(rows))
+    for _ in range(max_rounds):
+        bad = np.flatnonzero(groups[donors] == groups)
+        if bad.size == 0:
+            break
+        partners = rng.integers(0, len(rows), size=bad.size)
+        for index, partner in zip(bad.tolist(), partners.tolist()):
+            donors[index], donors[partner] = donors[partner], donors[index]
+    else:
+        raise RuntimeError("Could not find a cross-group donor permutation")
+
+    output = {}
+    for index, donor in enumerate(donors.tolist()):
+        items = [str(item_id) for item_id in rows[donor][1][:reference_items]]
+        if len(items) != reference_items:
+            raise ValueError(
+                f"Donor row {row_ids[donor]} has {len(items)} references, "
+                f"expected {reference_items}")
+        output[row_ids[index]] = {"donor": row_ids[donor], "items": items}
+    return output
+
+
+def load_history_donors(path: str | Path) -> dict[str, dict[str, list[str]]]:
+    """Read a donor file into split -> row ID -> donor reference item IDs."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if payload.get("schema") != HISTORY_DONOR_SCHEMA:
+        raise ValueError(f"Unsupported donor file schema: {payload.get('schema')!r}")
+    return {
+        split: {row_id: entry["items"] for row_id, entry in rows.items()}
+        for split, rows in payload["splits"].items()
+    }
+
+
 @dataclass(frozen=True)
 class TokenizedPlaylist:
     input_ids: np.ndarray
@@ -90,6 +182,8 @@ class GenPlaylistTokenizer:
         self.allow_repeated_items = False
         self.config = {"rq_codebook_size": TOKEN_LAYOUT.rq_codebook_size}
         self.dataset_dir = None
+        self.history_condition = "full"
+        self.history_donors = None
         self._validate_artifacts()
         self.collate_fn = {
             "train": self.collate_batch,
@@ -136,7 +230,76 @@ class GenPlaylistTokenizer:
         tokenizer.allow_repeated_items = bool(repeat_setting)
         tokenizer.config = config
         tokenizer.dataset_dir = str(data_root)
+        condition = str(config.get("history_condition", "full"))
+        donors = None
+        prepared_path = config.get("prepared_dataset_path", None)
+        if condition == "shuffled_cue" and prepared_path:
+            donor_path = Path(prepared_path).expanduser() / HISTORY_DONOR_FILE
+            if donor_path.is_file():
+                donors = load_history_donors(donor_path)
+        tokenizer.set_history_condition(condition, donors)
         return tokenizer
+
+    def set_history_condition(
+        self, condition: str, donors: dict[str, dict] | None = None,
+    ) -> None:
+        """Select the reference-history ablation variant.
+
+        ``donors`` maps split -> row ID -> donor reference item IDs and is
+        required before a ``shuffled_cue`` row can be encoded.
+        """
+        if condition not in HISTORY_CONDITIONS:
+            raise ValueError(
+                f"history_condition must be one of {HISTORY_CONDITIONS}, got {condition!r}")
+        if condition != "shuffled_cue" and donors:
+            raise ValueError("Only the shuffled_cue condition uses donor histories")
+        self.history_condition = condition
+        self.history_donors = (
+            {
+                str(split): {
+                    str(row_id): [str(item_id) for item_id in items]
+                    for row_id, items in rows.items()
+                }
+                for split, rows in donors.items()
+            }
+            if donors is not None else None
+        )
+
+    def _donor_references(self, split: str, row_id: str, count: int) -> list[str]:
+        if self.history_donors is None:
+            raise ValueError(
+                "shuffled_cue needs donor histories; build them with "
+                "scripts/prepare_wp_c_data.py --history-condition shuffled_cue")
+        try:
+            items = self.history_donors[str(split)][str(row_id)]
+        except KeyError as exc:
+            raise KeyError(f"No donor history for {split} row {row_id!r}") from exc
+        if len(items) != count:
+            raise ValueError(
+                f"Donor history for {row_id!r} has {len(items)} items, expected {count}")
+        return items
+
+    def encode_references(
+        self, reference_ids: list[str], *, split: str | None = None,
+        row_id: str | None = None,
+    ) -> list[int]:
+        """Encode history items under the configured history condition."""
+        semantic_end = 1 + RQ_N_CODEBOOKS + 1
+        donors = None
+        if self.history_condition == "shuffled_cue":
+            donors = self._donor_references(split, row_id, len(reference_ids))
+        tokens = []
+        for position, item_id in enumerate(reference_ids):
+            encoded = self.encode_item(item_id)
+            if self.history_condition == "latent_only":
+                encoded[semantic_end:] = [CUE_NULL_TOKEN] * self.active_cues
+            elif self.history_condition == "cue_only":
+                encoded[1:semantic_end] = [SEMANTIC_NULL_TOKEN] * (semantic_end - 1)
+            elif self.history_condition == "shuffled_cue":
+                encoded[semantic_end:] = [
+                    TOKEN_LAYOUT.cue_token(cue) for cue in self.item2cues[donors[position]]]
+            tokens.extend(encoded)
+        return tokens
 
     @classmethod
     def from_files(
@@ -244,7 +407,10 @@ class GenPlaylistTokenizer:
         cues = [TOKEN_LAYOUT.cue_token(cue) for cue in self.item2cues[item_id]]
         return [self.boi_token, *semantic, *cues]
 
-    def encode_playlist(self, item_ids: list[str], context_items: int) -> TokenizedPlaylist:
+    def encode_playlist(
+        self, item_ids: list[str], context_items: int, *, split: str | None = None,
+        row_id: str | None = None,
+    ) -> TokenizedPlaylist:
         ids = [str(item_id) for item_id in item_ids]
         if len(ids) < 3:
             raise ValueError(
@@ -256,13 +422,14 @@ class GenPlaylistTokenizer:
             raise ValueError("Sequence item IDs must be unique for this dataset")
 
         sequence = [self.bos_token]
-        target_mask = [False]
-        for item_index, item_id in enumerate(ids):
-            encoded = self.encode_item(item_id)
-            sequence.extend(encoded)
-            is_target = item_index >= context_items
-            target_mask.extend([False] + [is_target] * (self.tokens_per_item - 1))
+        sequence.extend(self.encode_references(
+            ids[:context_items], split=split, row_id=row_id))
+        for item_id in ids[context_items:]:
+            sequence.extend(self.encode_item(item_id))
         sequence.append(self.eos_token)
+        target_mask = [False] * (1 + context_items * self.tokens_per_item)
+        for _ in ids[context_items:]:
+            target_mask.extend([False] + [True] * (self.tokens_per_item - 1))
         target_mask.append(False)
 
         input_ids = np.asarray(sequence, dtype=np.int64)
@@ -272,6 +439,12 @@ class GenPlaylistTokenizer:
         context_emb = self.catalog_embeddings[context_rows]
         mu_c = context_emb.mean(axis=0, dtype=np.float32)
         sigma_c2 = np.float32(np.mean(np.sum((context_emb - mu_c) ** 2, axis=1)))
+        if self.history_condition == "cue_only":
+            # These CLHE statistics are unused while CFG and structure
+            # conditioning are off; zero them so the latent history cannot leak.
+            context_emb = np.zeros_like(context_emb)
+            mu_c = np.zeros_like(mu_c)
+            sigma_c2 = np.float32(0.0)
         return TokenizedPlaylist(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -450,6 +623,7 @@ class GenPlaylistTokenizer:
 
             def encode_row(row):
                 item_ids = [str(item_id) for item_id in row["item_seq"]]
+                row_id = str(row["bundle"])
                 if split == "test":
                     reference_count = protocol.eval_reference_items
                     target_count = protocol.eval_target_items
@@ -461,7 +635,8 @@ class GenPlaylistTokenizer:
                     reference_ids = item_ids[:reference_count]
                     target_ids = item_ids[reference_count:]
                     encoded = self.encode_playlist(
-                        [*reference_ids, *target_ids], context_items=reference_count)
+                        [*reference_ids, *target_ids], context_items=reference_count,
+                        split=split, row_id=row_id)
                 else:
                     reference_count = protocol.train_reference_items
                     target_count = protocol.train_target_items
@@ -472,7 +647,8 @@ class GenPlaylistTokenizer:
                     reference_ids = item_ids[:reference_count]
                     target_ids = item_ids[reference_count:]
                     encoded = self.encode_playlist(
-                        item_ids, context_items=reference_count)
+                        item_ids, context_items=reference_count,
+                        split=split, row_id=row_id)
                 result = {
                     "input_ids": encoded.input_ids.tolist(),
                     "sequence_mask": [True] * len(encoded.input_ids),
@@ -485,10 +661,11 @@ class GenPlaylistTokenizer:
                     "sigma_c2": float(encoded.sigma_c2),
                 }
                 if split == "test":
-                    context_tokens = [self.bos_token]
-                    for item_id in reference_ids:
-                        context_tokens.extend(self.encode_item(item_id))
-                    context_tokens.append(self.eos_token)
+                    context_tokens = [
+                        self.bos_token,
+                        *self.encode_references(reference_ids, split=split, row_id=row_id),
+                        self.eos_token,
+                    ]
                     result["input_ids"] = context_tokens
                     result["sequence_mask"] = [True] * len(context_tokens)
                     result["attention_mask"] = [

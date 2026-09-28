@@ -27,6 +27,20 @@ CUE_WEIGHT="${GENPLAYLIST_CUE_WEIGHT:-1.0}"
 CUE_WARMUP_INITIAL_WEIGHT="${GENPLAYLIST_CUE_WARMUP_INITIAL_WEIGHT:-0.1}"
 CUE_WARMUP_START_STEP="${GENPLAYLIST_CUE_WARMUP_START_STEP:-1000}"
 CUE_WARMUP_END_STEP="${GENPLAYLIST_CUE_WARMUP_END_STEP:-5000}"
+HISTORY_CONDITION="${GENPLAYLIST_HISTORY_CONDITION:-full}"
+SEED="${GENPLAYLIST_SEED:-1}"
+
+case "$HISTORY_CONDITION" in
+  full|latent_only|cue_only|shuffled_cue) ;;
+  *)
+    echo "GENPLAYLIST_HISTORY_CONDITION must be full, latent_only, cue_only, or shuffled_cue" >&2
+    exit 2
+    ;;
+esac
+if ! [[ "$SEED" =~ ^[0-9]+$ ]]; then
+  echo "GENPLAYLIST_SEED must be a non-negative integer" >&2
+  exit 2
+fi
 
 case "$ACTIVE_CUES" in
   0|4|8|16) ;;
@@ -95,7 +109,7 @@ case "$TRAIN_MODE" in
 esac
 
 # Generate unique run name with timestamp to avoid conflicts
-RUN_NAME="genplaylist-v4-${DATA_CONFIG}-joint15to5-${ACTIVE_CUES}cue-${STRUCTURE_VARIANT}-${LOSS_VARIANT}-$(date +%Y%m%d-%H%M%S)"
+RUN_NAME="genplaylist-v4-${DATA_CONFIG}-joint15to5-${ACTIVE_CUES}cue-history-${HISTORY_CONDITION}-${STRUCTURE_VARIANT}-${LOSS_VARIANT}-seed${SEED}-$(date +%Y%m%d-%H%M%S)"
 
 cd "$WP_ROOT"
 python main.py \
@@ -114,6 +128,8 @@ python main.py \
   cue_manifest_path="$CUE_ROOT/cue_manifest.json" \
   prepared_dataset_path="$PREPARED_DATA_ROOT" \
   active_cue_tokens="$ACTIVE_CUES" \
+  history_condition="$HISTORY_CONDITION" \
+  seed="$SEED" \
   model.length="$MODEL_LENGTH" \
   sampling.structure_conditioning="$STRUCTURE_CONDITIONING" \
   +run_name=${RUN_NAME} \

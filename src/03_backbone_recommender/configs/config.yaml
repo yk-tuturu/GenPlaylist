@@ -83,6 +83,9 @@ eval:
   # False for official metrics. True is recorded for explicitly named smoke or
   # speed-ablation runs that override seed, EMA, or reverse-diffusion steps.
   allow_protocol_override: false
+  # True only for diagnostics that evaluate a checkpoint on test contexts of a
+  # different history_condition (e.g. Full on shuffled_cue); marked unofficial.
+  allow_history_condition_mismatch: false
   disable_ema: False
   compute_generative_perplexity: False
   perplexity_batch_size: 8
@@ -166,6 +169,11 @@ prepared_dataset_path: null
 # WP-B stores 16 ranked candidates per song. The main model consumes the first
 # 8; 0/4/16 are separate layouts and require separately prepared data and training.
 active_cue_tokens: 8
+# Conditioning-channel ablation of the 15 reference items (targets are never
+# changed): full / latent_only / cue_only / shuffled_cue. Each value needs a
+# prepared dataset built with the same --history-condition. See
+# docs/ABLATION_CONDITIONING.md.
+history_condition: full
 feature_type: clhe
 sent_emb_pca: -1
 # Training windows contain exactly 15 references plus five continuation targets.

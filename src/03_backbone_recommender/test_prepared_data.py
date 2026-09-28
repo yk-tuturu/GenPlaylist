@@ -60,6 +60,30 @@ def test_dataset_specific_counts_are_supported():
         manifest, {"seq_len": 20, "protocol": {}}, FakeTokenizer(), dataset)
 
 
+def test_history_condition_must_match_the_prepared_cache():
+    manifest = valid_manifest()
+    manifest["history_condition"] = {"condition": "cue_only"}
+    validate_prepared_manifest(
+        manifest, {"seq_len": 20, "protocol": {}, "history_condition": "cue_only"},
+        FakeTokenizer())
+    for configured in ("full", "shuffled_cue"):
+        try:
+            validate_prepared_manifest(
+                manifest,
+                {"seq_len": 20, "protocol": {}, "history_condition": configured},
+                FakeTokenizer())
+        except ValueError as exc:
+            assert "history condition mismatch" in str(exc)
+        else:
+            raise AssertionError(f"Expected {configured!r} config on a cue_only cache to fail")
+
+
+def test_pre_ablation_caches_count_as_full():
+    validate_prepared_manifest(
+        valid_manifest(), {"seq_len": 20, "protocol": {}, "history_condition": "full"},
+        FakeTokenizer())
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

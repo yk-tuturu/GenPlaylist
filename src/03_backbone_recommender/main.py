@@ -103,6 +103,19 @@ def _load_from_checkpoint(config, tokenizer):
     config=config)
 
 
+def _checkpoint_history_condition(checkpoint_path):
+  """Return the history_condition a checkpoint was trained with.
+
+  load_from_checkpoint(config=...) replaces the saved hyperparameters with the
+  evaluation config, so the trained value is read from the file itself.
+  Checkpoints trained before the conditioning ablation are ``full``.
+  """
+  checkpoint = torch.load(
+    checkpoint_path, map_location='cpu', weights_only=False)
+  trained_config = checkpoint.get('hyper_parameters', {}).get('config', {}) or {}
+  return str(trained_config.get('history_condition', 'full'))
+
+
 @L.pytorch.utilities.rank_zero_only  # 装饰器：仅在主进程（rank 0）执行，用于分布式训练
 def _print_batch(train_ds, test_ds, tokenizer, k=64):
   """
@@ -211,6 +224,18 @@ def _rec_eval(config, logger, tokenizer, tokenized_dataset):
   allow_protocol_override = bool(config.eval.get('allow_protocol_override', False))
   OFFICIAL_EVALUATION_PROTOCOL.validate_config(
       config, allow_override=allow_protocol_override)
+  data_history_condition = str(config.get('history_condition', 'full'))
+  checkpoint_history_condition = _checkpoint_history_condition(
+      config.eval.checkpoint_path)
+  history_condition_mismatch = (
+      checkpoint_history_condition != data_history_condition)
+  if history_condition_mismatch and not bool(
+      config.eval.get('allow_history_condition_mismatch', False)):
+    raise ValueError(
+        f"Checkpoint was trained with history_condition="
+        f"{checkpoint_history_condition!r} but the test contexts use "
+        f"{data_history_condition!r}. Set "
+        "eval.allow_history_condition_mismatch=true for a diagnostic run.")
 
   # 加载训练好的模型和评估器
   model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
@@ -391,7 +416,12 @@ def _rec_eval(config, logger, tokenizer, tokenized_dataset):
           'full_catalog_retrieval': True,
           'generation': 'one_joint_full_mask_five_item_completion',
           'matching': 'hungarian_clhe_5x5',
-          'official_protocol': not allow_protocol_override,
+          'history_condition': {
+              'test_contexts': data_history_condition,
+              'checkpoint': checkpoint_history_condition,
+          },
+          'official_protocol': (
+              not allow_protocol_override and not history_condition_mismatch),
       },
       'metrics': dict(output_results),
       'predictions': {

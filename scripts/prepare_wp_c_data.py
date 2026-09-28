@@ -23,7 +23,13 @@ sys.path.insert(0, str(WP_ROOT))
 
 from dataset import AbstractDataset  # noqa: E402
 from config_composition import compose_wp_c_config  # noqa: E402
-from genplaylist_tokenizer import GenPlaylistTokenizer  # noqa: E402
+from genplaylist_tokenizer import (  # noqa: E402
+    HISTORY_CONDITIONS,
+    HISTORY_DONOR_FILE,
+    HISTORY_DONOR_SCHEMA,
+    GenPlaylistTokenizer,
+    build_history_donors,
+)
 from prepared_data import (  # noqa: E402
     PREPARED_DATA_VERSION,
     configured_source_paths,
@@ -157,10 +163,12 @@ def _build_vectors(root: Path, dataset, tokenizer) -> dict:
             row["item_seq"])
         ref_rows = [tokenizer.item_id_to_row[item_id] for item_id in references]
         tgt_rows = [tokenizer.item_id_to_row[item_id] for item_id in targets]
-        context = [tokenizer.bos_token]
-        for item_id in references:
-            context.extend(tokenizer.encode_item(item_id))
-        context.append(tokenizer.eos_token)
+        context = [
+            tokenizer.bos_token,
+            *tokenizer.encode_references(
+                references, split="test", row_id=str(row["bundle"])),
+            tokenizer.eos_token,
+        ]
         completed, completion_mask = tokenizer.build_item_completion(
             context, num_items=FROZEN_NEXT_SONG_PROTOCOL.eval_generated_items)
         ref_emb = catalog[ref_rows]
@@ -234,6 +242,12 @@ def main() -> int:
         choices=(0, 4, 8, 16),
         help="Ranked cues encoded per item; each value defines a separate model layout.")
     parser.add_argument(
+        "--history-condition", default="full", choices=HISTORY_CONDITIONS,
+        help="Conditioning-channel ablation applied to the 15 reference items.")
+    parser.add_argument(
+        "--donor-seed", type=int, default=42,
+        help="Seed for the shuffled_cue donor permutation (ignored otherwise).")
+    parser.add_argument(
         "--allow-dirty", action="store_true",
         help="Allow generation from an uncommitted worktree (recorded in the manifest).")
     args = parser.parse_args()
@@ -264,9 +278,12 @@ def main() -> int:
         config.cue_vocab_path = str(cue_dir / "cue_vocab.json")
         config.cue_manifest_path = str(cue_dir / "cue_manifest.json")
         config.active_cue_tokens = args.active_cues
+        config.history_condition = args.history_condition
         config.model.length = FROZEN_NEXT_SONG_PROTOCOL.model_token_length(
             1 + TOKEN_LAYOUT.rq_n_codebooks + 1 + args.active_cues)
         FROZEN_NEXT_SONG_PROTOCOL.validate_config(config)
+        if args.history_condition != "full" and args.active_cues == 0:
+            raise ValueError("History-condition ablations require active cues")
 
         dataset = AbstractDataset(config)
         counts = {split: len(rows) for split, rows in dataset.split_data.items()}
@@ -274,6 +291,30 @@ def main() -> int:
         if counts != expected_counts:
             raise ValueError(f"Frozen split counts changed: {counts}")
         tokenizer = GenPlaylistTokenizer.from_dataset_config(config, dataset)
+        history_record = {"condition": args.history_condition}
+        if args.history_condition == "shuffled_cue":
+            donor_splits = {
+                split: build_history_donors(
+                    list(zip(rows["bundle"], rows["item_seq"])),
+                    reference_items=FROZEN_NEXT_SONG_PROTOCOL.train_reference_items,
+                    seed=args.donor_seed + index)
+                for index, (split, rows) in enumerate(sorted(dataset.split_data.items()))
+            }
+            (temp / HISTORY_DONOR_FILE).write_text(json.dumps({
+                "schema": HISTORY_DONOR_SCHEMA,
+                "seed": args.donor_seed,
+                "reference_items": FROZEN_NEXT_SONG_PROTOCOL.train_reference_items,
+                "splits": donor_splits,
+            }, ensure_ascii=False) + "\n", encoding="utf-8")
+            tokenizer.set_history_condition("shuffled_cue", {
+                split: {row_id: entry["items"] for row_id, entry in rows.items()}
+                for split, rows in donor_splits.items()
+            })
+            history_record.update({
+                "donor_seed": args.donor_seed,
+                "donor_file": HISTORY_DONOR_FILE,
+                "donor_sha256": sha256_file(temp / HISTORY_DONOR_FILE),
+            })
 
         raw = DatasetDict(dataset.split_data)
         raw.save_to_disk(str(temp / "raw_dataset"))
@@ -306,6 +347,7 @@ def main() -> int:
                 "model_length": FROZEN_NEXT_SONG_PROTOCOL.model_token_length(
                     tokenizer.tokens_per_item),
             },
+            "history_condition": history_record,
             "split_counts": counts,
             "source_artifacts": source_manifest(configured_source_paths(config, dataset)),
             "vectors": vector_metadata,
