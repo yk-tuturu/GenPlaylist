@@ -22,6 +22,9 @@ ALLOW_PROTOCOL_OVERRIDE="${GENPLAYLIST_EVAL_ALLOW_PROTOCOL_OVERRIDE:-false}"
 ACTIVE_CUES="${GENPLAYLIST_ACTIVE_CUES:-8}"
 STRUCTURE_CONDITIONING="${GENPLAYLIST_STRUCTURE_CONDITIONING:-false}"
 HISTORY_CONDITION="${GENPLAYLIST_HISTORY_CONDITION:-full}"
+# Checkpoint file inside a GENPLAYLIST_OUTPUT_NAME run folder, e.g.
+# step-10000.ckpt for training curves.
+EVAL_CKPT_FILE="${GENPLAYLIST_EVAL_CKPT_FILE:-last.ckpt}"
 # true only for diagnostics such as a Full checkpoint on shuffled_cue contexts.
 ALLOW_HISTORY_MISMATCH="${GENPLAYLIST_EVAL_ALLOW_HISTORY_MISMATCH:-false}"
 case "$HISTORY_CONDITION" in
@@ -60,15 +63,39 @@ SAMPLING_STEPS="${GENPLAYLIST_EVAL_SAMPLING_STEPS:-256}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULTS_ROOT="${GENPLAYLIST_EVAL_RESULTS_ROOT:-$WP_ROOT/outputs/evaluation}"
 
+source "$SCRIPT_DIR/run_layout.sh"
+if [[ -z "$EVAL_CKPT" && -n "$RUN_DIR" ]]; then
+  EVAL_CKPT="$RUN_DIR/checkpoints/$EVAL_CKPT_FILE"
+fi
 if [[ -z "$EVAL_CKPT" ]]; then
-  echo "GENPLAYLIST_EVAL_CKPT must point to the checkpoint to evaluate." >&2
+  echo "Set GENPLAYLIST_OUTPUT_NAME to evaluate a named run, or GENPLAYLIST_EVAL_CKPT." >&2
   exit 2
+fi
+if [[ ! -f "$EVAL_CKPT" ]]; then
+  echo "Checkpoint not found: $EVAL_CKPT" >&2
+  exit 1
 fi
 # Hydra changes into a fresh run directory, so relative paths would break.
 EVAL_CKPT="$(realpath "$EVAL_CKPT")"
 
 CKPT_LABEL="$(basename "$EVAL_CKPT" .ckpt)"
-RESULTS_PATH="${GENPLAYLIST_EVAL_RESULTS_PATH:-$RESULTS_ROOT/wp-c-${CKPT_LABEL}-${ACTIVE_CUES}cue-history-${HISTORY_CONDITION}-structure${STRUCTURE_CONDITIONING}-steps${SAMPLING_STEPS}-seed${EVAL_SEED}-${STAMP}.json}"
+EVAL_RUN_DIR_ARGS=()
+if [[ -n "$RUN_DIR" ]]; then
+  # Results live inside the run folder, next to its checkpoints.
+  RESULT_NAME="${CKPT_LABEL}-steps${SAMPLING_STEPS}-evalseed${EVAL_SEED}"
+  if [[ "$ALLOW_HISTORY_MISMATCH" == true ]]; then
+    RESULT_NAME="on-${HISTORY_CONDITION}-${RESULT_NAME}"
+  fi
+  DEFAULT_RESULTS_PATH="$RUN_DIR/results/${RESULT_NAME}.json"
+  if [[ -z "${GENPLAYLIST_EVAL_RESULTS_PATH:-}" && -e "$DEFAULT_RESULTS_PATH" ]]; then
+    echo "Result already exists: $DEFAULT_RESULTS_PATH (delete it to re-evaluate)" >&2
+    exit 1
+  fi
+  EVAL_RUN_DIR_ARGS=(hydra.run.dir="$RUN_DIR/eval-runs/${RESULT_NAME}-${STAMP}")
+else
+  DEFAULT_RESULTS_PATH="$RESULTS_ROOT/wp-c-${CKPT_LABEL}-${ACTIVE_CUES}cue-history-${HISTORY_CONDITION}-structure${STRUCTURE_CONDITIONING}-steps${SAMPLING_STEPS}-seed${EVAL_SEED}-${STAMP}.json"
+fi
+RESULTS_PATH="${GENPLAYLIST_EVAL_RESULTS_PATH:-$DEFAULT_RESULTS_PATH}"
 
 for required in \
   "$EVAL_CKPT" \
@@ -119,6 +146,7 @@ python main.py \
   sampling.steps="$SAMPLING_STEPS" \
   parameterization=subs \
   eval.compute_generative_perplexity=false \
-  +run_name="genplaylist-v4-${DATA_CONFIG}-${ACTIVE_CUES}cue-structure${STRUCTURE_CONDITIONING}-joint15to5-official-eval-${STAMP}"
+  +run_name="genplaylist-v4-${DATA_CONFIG}-${ACTIVE_CUES}cue-structure${STRUCTURE_CONDITIONING}-joint15to5-official-eval-${STAMP}" \
+  ${EVAL_RUN_DIR_ARGS[@]+"${EVAL_RUN_DIR_ARGS[@]}"}
 
 echo "Official WP-C result: $RESULTS_PATH"

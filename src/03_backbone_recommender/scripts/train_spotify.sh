@@ -108,6 +108,25 @@ case "$TRAIN_MODE" in
     ;;
 esac
 
+# Fixed run folder when GENPLAYLIST_OUTPUT_NAME is set; dated Hydra folder otherwise.
+source "$SCRIPT_DIR/run_layout.sh"
+RUN_DIR_ARGS=()
+if [[ -n "$RUN_DIR" ]]; then
+  LAST_CKPT="$RUN_DIR/checkpoints/last.ckpt"
+  if [[ "$TRAIN_MODE" == resume ]]; then
+    if [[ ! -f "$LAST_CKPT" ]]; then
+      echo "Nothing to resume: $LAST_CKPT does not exist" >&2
+      exit 1
+    fi
+  elif [[ -e "$LAST_CKPT" ]]; then
+    echo "Run folder already holds a checkpoint: $RUN_DIR" >&2
+    echo "Use GENPLAYLIST_TRAIN_MODE=resume, a different GENPLAYLIST_OUTPUT_NAME, or delete it." >&2
+    exit 1
+  fi
+  RUN_DIR_ARGS=(hydra.run.dir="$RUN_DIR")
+  echo "Run folder: $RUN_DIR"
+fi
+
 # Generate unique run name with timestamp to avoid conflicts
 RUN_NAME="genplaylist-v4-${DATA_CONFIG}-joint15to5-${ACTIVE_CUES}cue-history-${HISTORY_CONDITION}-${STRUCTURE_VARIANT}-${LOSS_VARIANT}-seed${SEED}-$(date +%Y%m%d-%H%M%S)"
 
@@ -143,4 +162,23 @@ python main.py \
   parameterization=subs \
   eval.compute_generative_perplexity=False \
   sampling.steps=25 \
-  "${CHECKPOINT_ARGS[@]}"
+  "${CHECKPOINT_ARGS[@]}" \
+  ${RUN_DIR_ARGS[@]+"${RUN_DIR_ARGS[@]}"}
+
+# Append one row per finished named run to the shared run registry.
+if [[ -n "$RUN_DIR" ]]; then
+  if [[ ! -f "$LAST_CKPT" ]]; then
+    echo "Training ended without $LAST_CKPT; not recording it in runs.csv" >&2
+    exit 0
+  fi
+  REGISTRY="$OUTPUT_ROOT/runs.csv"
+  if [[ ! -f "$REGISTRY" ]]; then
+    echo "finished_utc,output_name,data_config,history_condition,active_cues,loss_variant,seed,max_steps,train_mode,git_commit,git_dirty,prepared_manifest_sha256,checkpoint,checkpoint_sha256" > "$REGISTRY"
+  fi
+  GIT_DIRTY=false
+  if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
+    GIT_DIRTY=true
+  fi
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$OUTPUT_NAME,$DATA_CONFIG,$HISTORY_CONDITION,$ACTIVE_CUES,$LOSS_VARIANT,$SEED,$MAX_STEPS,$TRAIN_MODE,$(git -C "$REPO_ROOT" rev-parse HEAD),$GIT_DIRTY,$(sha256sum "$PREPARED_DATA_ROOT/prepared_manifest.json" | cut -d' ' -f1),$LAST_CKPT,$(sha256sum "$LAST_CKPT" | cut -d' ' -f1)" >> "$REGISTRY"
+  echo "Recorded run in $REGISTRY"
+fi

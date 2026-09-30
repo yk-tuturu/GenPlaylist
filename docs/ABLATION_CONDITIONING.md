@@ -73,8 +73,9 @@ reference item *p* of the donor row.
 | `scripts/validate_wp_c_prepared_data.py` | `--history-condition`. Independently re-derives **every** train and test row from catalog tokens and checks the variant: blanks where expected, real target tokens, donor cues, cross-group donors, permutation, zeroed CLHE statistics for `cue_only`, and Arrow test contexts equal to the stored vectors. |
 | `src/03_backbone_recommender/configs/config.yaml` | `history_condition: full` and `eval.allow_history_condition_mismatch: false`. |
 | `src/03_backbone_recommender/main.py` | `rec_eval` reads the checkpoint's trained `history_condition` and refuses test contexts of a different condition, unless the mismatch override is set. The result JSON records both conditions under `evaluation.history_condition`; a mismatch is marked `official_protocol: false`. |
-| `scripts/train_spotify.sh` | `GENPLAYLIST_HISTORY_CONDITION` (default `full`) and `GENPLAYLIST_SEED` (default `1`); both appear in the run name. |
-| `scripts/eval_spotify.sh` | `GENPLAYLIST_HISTORY_CONDITION`, `GENPLAYLIST_EVAL_ALLOW_HISTORY_MISMATCH`; the condition appears in the result filename. The checkpoint path is resolved to an absolute path, because Hydra changes directory. |
+| `scripts/train_spotify.sh` | `GENPLAYLIST_HISTORY_CONDITION` (default `full`) and `GENPLAYLIST_SEED` (default `1`); both appear in the run name. With `GENPLAYLIST_OUTPUT_NAME`, the run uses that folder and is logged to `runs.csv` (see [Run folders](#run-folders)). |
+| `scripts/eval_spotify.sh` | `GENPLAYLIST_HISTORY_CONDITION`, `GENPLAYLIST_EVAL_ALLOW_HISTORY_MISMATCH`; the condition appears in the result filename. The checkpoint path is resolved to an absolute path, because Hydra changes directory. With `GENPLAYLIST_OUTPUT_NAME`, it evaluates that folder's checkpoint and writes results into it. |
+| `scripts/run_layout.sh` | Shared run-folder naming for both runners. |
 | `test_history_condition.py`, `test_prepared_data.py` | Tests covering all four variants, donor rules, and the manifest guard. |
 
 With `history_condition=full`, the tokens are byte-identical to the
@@ -94,7 +95,7 @@ outputs, and `checkpoints/pretrained/ddbc/spotify30.ckpt`. Always pass
 absolute paths.
 
 ```bash
-export REPO=$HOME/tt_workspace/waikei-ablation/GenPlaylist
+export REPO=$HOME/tt_workspace/waikei-ablation/GenPlaylist OUT=$HOME/tt_workspace/waikei-ablation/GenPlaylist/src/03_backbone_recommender/outputs
 ```
 
 ### 1. Prepare and validate (once per variant and dataset)
@@ -105,14 +106,81 @@ MPD:
 for V in full latent_only cue_only shuffled_cue; do python $REPO/scripts/prepare_wp_c_data.py --data-dir $REPO/data/dataset --artifact-dir $REPO/data/dataset --output-dir $REPO/data/processed/ablation-mpd-8cue-$V --active-cues 8 --history-condition $V --donor-seed 42 && python $REPO/scripts/validate_wp_c_prepared_data.py --data-dir $REPO/data/dataset --artifact-dir $REPO/data/dataset --prepared-dir $REPO/data/processed/ablation-mpd-8cue-$V --active-cues 8 --history-condition $V; done
 ```
 
-For Music4All, use `--data-dir $REPO/data/dataset-music4all-onion-v1` and
-output directories `ablation-m4a-8cue-$V`. The artifact and cue directories
-depend on which Music4All catalog is frozen; confirm this before preparing.
+For Music4All, use the expanded **v3-u500** catalog built at commit `613bdf5`
+(10,950 songs, 1,227,307 training windows, 19,771 test histories; empty
+validation split). Its three source folders are, on the server under
+`/home/wjzhang/tt_workspace/model/GenPlaylist`:
+
+| Role | Folder | Key file SHA-256 |
+|---|---|---|
+| `--data-dir` / `GENPLAYLIST_DATA_ROOT` | `data/dataset-music4all-onion-v3-u500` | `catalog_metadata.json` `8f8abf7f…` |
+| `--artifact-dir` / `GENPLAYLIST_ARTIFACT_ROOT` | `data/artifacts-music4all-onion-v3-u500` | `item_id_to_row.json` `cf86c136…` |
+| `--cue-dir` / `GENPLAYLIST_CUE_ROOT` | `data/processed/cues-music4all-onion-v3-u500/latest` | `item2cues.json` `7e8c5642…` |
+
+The cue vocabulary is byte-identical to MPD's (`cue_vocab.json` `cd229492…`),
+so cue IDs mean the same on both datasets. Always pass `--cue-dir`; otherwise
+prep falls back to the MPD cues.
+
+```bash
+D=$REPO/data/dataset-music4all-onion-v3-u500; A=$REPO/data/artifacts-music4all-onion-v3-u500; C=$REPO/data/processed/cues-music4all-onion-v3-u500/latest
+```
+
+```bash
+for V in full latent_only cue_only shuffled_cue; do python $REPO/scripts/prepare_wp_c_data.py --data-dir $D --artifact-dir $A --cue-dir $C --output-dir $REPO/data/processed/ablation-m4a-v3-u500-8cue-$V --active-cues 8 --history-condition $V --donor-seed 42 && python $REPO/scripts/validate_wp_c_prepared_data.py --data-dir $D --artifact-dir $A --cue-dir $C --prepared-dir $REPO/data/processed/ablation-m4a-v3-u500-8cue-$V --active-cues 8 --history-condition $V; done
+```
+
+Each Music4All prepared folder is about 2.5 GB, and evaluation covers ~20x
+more test histories than MPD.
+
+### Run folders
+
+Set `GENPLAYLIST_OUTPUT_NAME` to choose a run's folder yourself, instead of
+Hydra's dated `outputs/<data>/<date>/<time>/`. Slashes group runs:
+
+```
+src/03_backbone_recommender/outputs/
+├── runs.csv                              one row per finished named training run
+└── ablation-cond/mpd/cue_only-seed2/     GENPLAYLIST_OUTPUT_NAME
+    ├── .hydra/
+    ├── checkpoints/{last,step-500,...}.ckpt
+    ├── results/last-steps256-evalseed1.json
+    └── eval-runs/...                     Hydra folders of evaluation runs
+```
+
+- The name is used exactly as given (letters, digits, `.`, `_`, `-`, and `/`
+  between names). Nothing else about the run is encoded in it, so put the
+  variant, seed, and anything non-default (cue count, loss schedule, a
+  500-step smoke run) into the name yourself.
+- Training refuses to start in a folder that already has `last.ckpt`.
+  `GENPLAYLIST_TRAIN_MODE=resume` continues a crashed run in the same folder;
+  resume with the same variables as the original run.
+- `runs.csv` records time, output name, dataset, condition, cues, loss variant,
+  seed, steps, train mode, git commit, dirty flag, prepared-manifest SHA-256,
+  checkpoint path, and checkpoint SHA-256. A resumed run adds a new row; the
+  latest row for a name is the final one.
+- Evaluation with the same `GENPLAYLIST_OUTPUT_NAME` evaluates that folder's
+  `last.ckpt` (`GENPLAYLIST_EVAL_CKPT_FILE=step-10000.ckpt` picks an
+  intermediate one) and writes to its `results/` folder. It refuses to
+  overwrite an existing result. `GENPLAYLIST_EVAL_SEED` stays the sampling
+  seed (1).
+- `GENPLAYLIST_OUTPUT_ROOT` moves the whole tree (default
+  `src/03_backbone_recommender/outputs`).
+
+Without `GENPLAYLIST_OUTPUT_NAME`, both runners behave exactly as before.
+
+Runs trained before this layout can be linked into it once. The link only
+points at the old dated folder; nothing is copied:
+
+```bash
+mkdir -p $OUT/ablation-cond/mpd; for V in full latent_only cue_only shuffled_cue; do R=$(grep -lx -- "- history_condition=$V" $OUT/spotify/*/*/.hydra/overrides.yaml | xargs grep -lx -- "- seed=1" | xargs grep -lx -- "- trainer.max_steps=20000" | xargs -n1 dirname | xargs -n1 dirname); [ $(echo "$R" | grep -c .) -eq 1 ] && ln -sfn "$R" $OUT/ablation-cond/mpd/$V-seed1 || echo "check $V: $R"; done
+```
+
+Linked runs are not in `runs.csv`; record their checkpoint hashes by hand.
 
 ### 2. Smoke test (500 steps per new variant)
 
 ```bash
-CUDA_VISIBLE_DEVICES=7 GENPLAYLIST_HISTORY_CONDITION=cue_only GENPLAYLIST_PREPARED_DATA_ROOT=$REPO/data/processed/ablation-mpd-8cue-cue_only GENPLAYLIST_MAX_STEPS=500 bash $REPO/src/03_backbone_recommender/scripts/train_spotify.sh 2>&1 | tee smoke_cue_only.log
+CUDA_VISIBLE_DEVICES=7 GENPLAYLIST_OUTPUT_NAME=smoke/mpd/cue_only GENPLAYLIST_HISTORY_CONDITION=cue_only GENPLAYLIST_PREPARED_DATA_ROOT=$REPO/data/processed/ablation-mpd-8cue-cue_only GENPLAYLIST_MAX_STEPS=500 bash $REPO/src/03_backbone_recommender/scripts/train_spotify.sh 2>&1 | tee smoke_cue_only.log
 ```
 
 ### 3. Train (4 variants x 3 seeds x 2 datasets = 24 runs)
@@ -120,32 +188,37 @@ CUDA_VISIBLE_DEVICES=7 GENPLAYLIST_HISTORY_CONDITION=cue_only GENPLAYLIST_PREPAR
 One seed of all four MPD variants, sequentially on one GPU:
 
 ```bash
-for V in full latent_only cue_only shuffled_cue; do CUDA_VISIBLE_DEVICES=7 GENPLAYLIST_HISTORY_CONDITION=$V GENPLAYLIST_SEED=1 GENPLAYLIST_PREPARED_DATA_ROOT=$REPO/data/processed/ablation-mpd-8cue-$V bash $REPO/src/03_backbone_recommender/scripts/train_spotify.sh 2>&1 | tee train_mpd_${V}_s1.log; done
+SEED=1; for V in full latent_only cue_only shuffled_cue; do CUDA_VISIBLE_DEVICES=7 GENPLAYLIST_OUTPUT_NAME=ablation-cond/mpd/$V-seed$SEED GENPLAYLIST_HISTORY_CONDITION=$V GENPLAYLIST_SEED=$SEED GENPLAYLIST_PREPARED_DATA_ROOT=$REPO/data/processed/ablation-mpd-8cue-$V bash $REPO/src/03_backbone_recommender/scripts/train_spotify.sh 2>&1 | tee train_mpd_${V}_s$SEED.log; done
 ```
 
-Repeat with `GENPLAYLIST_SEED=2` and `3`. For Music4All, also set
-`GENPLAYLIST_DATA_CONFIG=music4all` and
-`GENPLAYLIST_DATA_ROOT=$REPO/data/dataset-music4all-onion-v1`. Checkpoints are
-written to
-`src/03_backbone_recommender/outputs/<spotify|music4all>/<date>/<time>/checkpoints/last.ckpt`.
+Repeat with `SEED=2` and `3`. For Music4All, name the runs
+`ablation-cond/m4a/$V-seed$SEED`, also set `GENPLAYLIST_DATA_CONFIG=music4all`,
+`GENPLAYLIST_DATA_ROOT=$D`, `GENPLAYLIST_ARTIFACT_ROOT=$A`,
+`GENPLAYLIST_CUE_ROOT=$C`, and use the `ablation-m4a-v3-u500-8cue-$V` prepared
+folders.
 
 ### 4. Evaluate
 
-Use the same condition and prepared directory as in training:
+Use the same output name and variables as in training, without a checkpoint
+path:
 
 ```bash
-CUDA_VISIBLE_DEVICES=7 GENPLAYLIST_HISTORY_CONDITION=cue_only GENPLAYLIST_PREPARED_DATA_ROOT=$REPO/data/processed/ablation-mpd-8cue-cue_only GENPLAYLIST_EVAL_CKPT=/abs/path/to/last.ckpt bash $REPO/src/03_backbone_recommender/scripts/eval_spotify.sh
+SEED=1; for V in full latent_only cue_only shuffled_cue; do CUDA_VISIBLE_DEVICES=7 GENPLAYLIST_OUTPUT_NAME=ablation-cond/mpd/$V-seed$SEED GENPLAYLIST_HISTORY_CONDITION=$V GENPLAYLIST_PREPARED_DATA_ROOT=$REPO/data/processed/ablation-mpd-8cue-$V bash $REPO/src/03_backbone_recommender/scripts/eval_spotify.sh; done
 ```
 
-Then compute the MERT metrics and bootstrap intervals with
-`scripts/evaluate_mert_proxy.py` on each result JSON.
+Then compute the MERT metrics and bootstrap intervals for each result:
+
+```bash
+SEED=1; for V in full latent_only cue_only shuffled_cue; do R=$OUT/ablation-cond/mpd/$V-seed$SEED/results/last-steps256-evalseed1.json; python $REPO/scripts/evaluate_mert_proxy.py --prediction-result $R --mert-dir /path/to/mert-v1-95m-catalog-v1 --output ${R%.json}-mert.json; done
+```
 
 **Diagnostic (no training):** the Full checkpoint evaluated on shuffled
 test cues tests whether Full reads its cues at inference. The result is marked
-unofficial.
+unofficial and saved as `on-shuffled_cue-last-steps256-evalseed1.json` in the
+Full run's folder.
 
 ```bash
-CUDA_VISIBLE_DEVICES=7 GENPLAYLIST_HISTORY_CONDITION=shuffled_cue GENPLAYLIST_EVAL_ALLOW_HISTORY_MISMATCH=true GENPLAYLIST_PREPARED_DATA_ROOT=$REPO/data/processed/ablation-mpd-8cue-shuffled_cue GENPLAYLIST_EVAL_CKPT=/abs/path/to/full/last.ckpt bash $REPO/src/03_backbone_recommender/scripts/eval_spotify.sh
+CUDA_VISIBLE_DEVICES=7 GENPLAYLIST_OUTPUT_NAME=ablation-cond/mpd/full-seed1 GENPLAYLIST_HISTORY_CONDITION=shuffled_cue GENPLAYLIST_EVAL_ALLOW_HISTORY_MISMATCH=true GENPLAYLIST_PREPARED_DATA_ROOT=$REPO/data/processed/ablation-mpd-8cue-shuffled_cue bash $REPO/src/03_backbone_recommender/scripts/eval_spotify.sh
 ```
 
 ## Reading the results
