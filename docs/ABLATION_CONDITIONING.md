@@ -63,29 +63,199 @@ reference item *p* of the donor row.
   `history_donors.json` in the prepared directory, together with each donor's
   row ID. The file's hash is recorded in the manifest.
 
-## Code changes
+## Repository changes
 
-| File | Change |
+The ablation was added in two commits on branch `waikei-ablation`, on top of
+`aa65657` (merge of `waikei-test`, which contains tuteng's last Music4All
+commit `613bdf5`).
+
+| Commit | Date | Summary |
+|---|---|---|
+| `3d98434` | 2026-09-29 | History-condition ablation: tokenizer, data preparation, validation, evaluation guard, runner flags, tests, this document |
+| `5fd6457` | 2026-10-01 | Named run folders (`GENPLAYLIST_OUTPUT_NAME`), resume, and the `runs.csv` registry |
+
+### Commit `3d98434`: history-condition ablation
+
+**`src/03_backbone_recommender/genplaylist_tokenizer.py`**
+
+- New constants: `HISTORY_CONDITIONS` (`full`, `latent_only`, `cue_only`,
+  `shuffled_cue`), `CUE_NULL_TOKEN` (cue ID 0, `<unk>`, token 845),
+  `SEMANTIC_NULL_TOKEN` (0, the padding/BOS token), `HISTORY_DONOR_FILE`
+  (`history_donors.json`), and `HISTORY_DONOR_SCHEMA`.
+- New functions:
+  - `history_group(row_id)`: the playlist (MPD `<playlist>:joint5:<start>`) or
+    user pseudonym (Music4All `m4a-<split>-<user>-...`) that produced a row.
+  - `build_history_donors(rows, reference_items, seed)`: a seeded permutation
+    in which every row receives a donor from a different group and every row
+    donates exactly once. It refuses when one group owns more than half the
+    rows, because no such permutation exists then.
+  - `load_history_donors(path)`: reads `history_donors.json`.
+- New tokenizer methods:
+  - `set_history_condition(condition, donors=None)` validates and stores the
+    variant. Donors are only accepted for `shuffled_cue`.
+  - `encode_references(reference_ids, split=, row_id=)` encodes history items
+    under the variant. It is now the single place where history items are
+    encoded: in `encode_playlist`, in the test branch of `tokenize`, and in the
+    prepared test vectors.
+- `encode_playlist` takes optional `split` and `row_id` and builds the target
+  mask independently of the history encoding. For `cue_only`, it zeroes
+  `context_emb`, `mu_c`, and `sigma_c2`.
+- `tokenize` passes each row's `bundle` ID through as `row_id`.
+- `from_dataset_config` reads `history_condition` from the config and, for
+  `shuffled_cue`, loads `history_donors.json` from `prepared_dataset_path`.
+- Target items, `encode_item`, decoding, the type mask, and the completion
+  builder are unchanged.
+
+**`scripts/prepare_wp_c_data.py`**
+
+- New flags: `--history-condition` (default `full`) and `--donor-seed`
+  (default 42; test donors use the seed, train donors the seed + 1).
+- For `shuffled_cue`, writes `history_donors.json` into the prepared folder,
+  covered by the folder's output hashes.
+- The manifest gains `history_condition: {condition, donor_seed, donor_file,
+  donor_sha256}`; the donor fields only appear for `shuffled_cue`.
+- Refuses a non-`full` condition with `--active-cues 0`.
+
+**`src/03_backbone_recommender/prepared_data.py`**
+
+- `validate_prepared_manifest` raises `Prepared history condition mismatch`
+  when the cache's condition differs from the configured `history_condition`.
+- New `prepared_history_condition(manifest)`; manifests without the field
+  count as `full`.
+
+**`scripts/validate_wp_c_prepared_data.py`**
+
+- New flag `--history-condition`; it also passes the prepared folder to the
+  tokenizer so donors load.
+- New `_validate_history_condition` re-derives every train and test row
+  from catalog tokens, independently of the tokenizer, and checks:
+  - BOI at every item start
+  - nulls where the variant blanks a channel, real tokens elsewhere
+  - real RVQ and cue tokens on all five train targets
+  - `shuffled_cue`: donor map covers exactly the split, donors come from
+    another group, donor items equal the donor row's references, and the
+    assignment is a permutation
+  - no donor file for other conditions
+  - `cue_only`: zeroed `mu_c` and `context_emb`
+  - Arrow test contexts identical to `vectors/eval_context_input_ids.npy`
+  - `latent_only`: no real catalog cue equals the cue-null token
+
+**`src/03_backbone_recommender/configs/config.yaml`**
+
+- `history_condition: full`
+- `eval.allow_history_condition_mismatch: false`
+
+**`src/03_backbone_recommender/main.py`**
+
+- New `_checkpoint_history_condition(path)` reads the condition a checkpoint
+  was *trained* with from its saved hyperparameters. Evaluation overrides the
+  in-memory hyperparameters, so the file is read directly. Older checkpoints
+  count as `full`.
+- `rec_eval` refuses test contexts of a different condition unless
+  `eval.allow_history_condition_mismatch=true`.
+- The result JSON gains `evaluation.history_condition: {test_contexts,
+  checkpoint}`. `evaluation.official_protocol` is false when the protocol
+  override or a condition mismatch is used.
+
+**`src/03_backbone_recommender/scripts/train_spotify.sh`**
+
+- `GENPLAYLIST_HISTORY_CONDITION` (default `full`) and `GENPLAYLIST_SEED`
+  (default `1`, passed as Hydra `seed=`). Both are validated and appear in the
+  run name.
+
+**`src/03_backbone_recommender/scripts/eval_spotify.sh`**
+
+- `GENPLAYLIST_HISTORY_CONDITION` and `GENPLAYLIST_EVAL_ALLOW_HISTORY_MISMATCH`;
+  the condition appears in the default result filename.
+- `GENPLAYLIST_EVAL_CKPT` is resolved to an absolute path. Hydra changes into
+  a new run folder, so relative checkpoint paths used to fail.
+
+**Tests**
+
+- New `test_history_condition.py` (11 tests): `full` is byte-identical to plain
+  item encoding; each variant blanks or swaps only the history channel;
+  targets are never changed; `cue_only` contexts are accepted by joint
+  completion; `shuffled_cue` without donors is rejected; unknown conditions
+  are rejected; row-ID parsing for MPD and Music4All; donors are a
+  cross-group permutation, deterministic per seed, and impossible
+  assignments are rejected.
+- `test_prepared_data.py` (+2 tests): condition mismatch is rejected;
+  pre-ablation manifests count as `full`.
+
+### Commit `5fd6457`: named run folders
+
+**New `src/03_backbone_recommender/scripts/run_layout.sh`** (sourced by both
+runners): resolves `GENPLAYLIST_OUTPUT_ROOT` (default
+`src/03_backbone_recommender/outputs`) and `GENPLAYLIST_OUTPUT_NAME`, and
+rejects names with characters outside `A-Z a-z 0-9 . _ -`, `.`/`..`
+components, or empty components.
+
+**`src/03_backbone_recommender/scripts/train_spotify.sh`**
+
+- With `GENPLAYLIST_OUTPUT_NAME`, passes `hydra.run.dir=<root>/<name>`.
+- Refuses to start when that folder already has `checkpoints/last.ckpt`.
+- `GENPLAYLIST_TRAIN_MODE=resume` requires an existing `last.ckpt` and continues
+  in the same folder.
+- After a successful run, appends a row to `<root>/runs.csv`: finish time,
+  output name, data config, history condition, active cues, loss variant,
+  seed, max steps, train mode, git commit, dirty flag, prepared-manifest
+  SHA-256, checkpoint path, and checkpoint SHA-256.
+
+**`src/03_backbone_recommender/scripts/eval_spotify.sh`**
+
+- With `GENPLAYLIST_OUTPUT_NAME` and no `GENPLAYLIST_EVAL_CKPT`, evaluates
+  `<name>/checkpoints/$GENPLAYLIST_EVAL_CKPT_FILE` (default `last.ckpt`).
+- Writes `<name>/results/<checkpoint>-steps<S>-evalseed<E>.json`, prefixed
+  with `on-<condition>-` for mismatch diagnostics. Refuses to overwrite an
+  existing result unless `GENPLAYLIST_EVAL_RESULTS_PATH` is given.
+- Hydra scratch folders go to `<name>/eval-runs/`.
+- A missing checkpoint gives `Checkpoint not found: ...`.
+
+Without `GENPLAYLIST_OUTPUT_NAME`, both runners behave exactly as before
+(dated `outputs/<data>/<date>/<time>/` folders, timestamped result files).
+
+### What did not change
+
+- The frozen protocol (15 references -> 5 targets, 256 sampling steps, seed 1,
+  EMA, full-catalog retrieval, Hungarian matching), model architecture, loss
+  curriculum, and the official evaluator.
+- `history_condition=full` produces exactly the pre-ablation tokens.
+- The WP-D runtime (`backbone_runtime.py`) still encodes contexts as `full`.
+  Only Full checkpoints should be used for synthesis.
+
+### Consequences
+
+- `genplaylist_tokenizer.py`, `prepare_wp_c_data.py`, and `prepared_data.py`
+  are fingerprinted by every prepared cache. **All prepared folders built
+  before `3d98434`, including Full, are rejected and must be rebuilt.**
+- Tuteng's v3-u500 Music4All cache (commit `613bdf5`) is one of them; its
+  three source folders are reused, not the cache itself.
+
+### Experiment runners (`scripts/ablation/`)
+
+These wrap `train_spotify.sh` and `eval_spotify.sh` with the per-dataset paths,
+so a whole seed or dataset runs with one command. They find the repository
+from their own location, so they work in any clone. Each refuses to start when
+`GENPLAYLIST_*` variables are already set or required data is missing, and
+continues with the next run when one fails.
+
+| Script | Purpose |
 |---|---|
-| `src/03_backbone_recommender/genplaylist_tokenizer.py` | `HISTORY_CONDITIONS`, null-token constants, `history_group`, `build_history_donors`, `load_history_donors`; `set_history_condition` and `encode_references` apply the variant to history items in `encode_playlist`, train/test `tokenize`, and prepared test vectors. `from_dataset_config` reads `history_condition` and loads donors from the prepared directory. |
-| `scripts/prepare_wp_c_data.py` | `--history-condition` and `--donor-seed`; writes `history_donors.json` for `shuffled_cue`; records `history_condition` in `prepared_manifest.json`; test context vectors use the variant. |
-| `src/03_backbone_recommender/prepared_data.py` | Training and evaluation refuse a prepared cache whose `history_condition` differs from the configured one. Caches without the field count as `full`. |
-| `scripts/validate_wp_c_prepared_data.py` | `--history-condition`. Independently re-derives **every** train and test row from catalog tokens and checks the variant: blanks where expected, real target tokens, donor cues, cross-group donors, permutation, zeroed CLHE statistics for `cue_only`, and Arrow test contexts equal to the stored vectors. |
-| `src/03_backbone_recommender/configs/config.yaml` | `history_condition: full` and `eval.allow_history_condition_mismatch: false`. |
-| `src/03_backbone_recommender/main.py` | `rec_eval` reads the checkpoint's trained `history_condition` and refuses test contexts of a different condition, unless the mismatch override is set. The result JSON records both conditions under `evaluation.history_condition`; a mismatch is marked `official_protocol: false`. |
-| `scripts/train_spotify.sh` | `GENPLAYLIST_HISTORY_CONDITION` (default `full`) and `GENPLAYLIST_SEED` (default `1`); both appear in the run name. With `GENPLAYLIST_OUTPUT_NAME`, the run uses that folder and is logged to `runs.csv` (see [Run folders](#run-folders)). |
-| `scripts/eval_spotify.sh` | `GENPLAYLIST_HISTORY_CONDITION`, `GENPLAYLIST_EVAL_ALLOW_HISTORY_MISMATCH`; the condition appears in the result filename. The checkpoint path is resolved to an absolute path, because Hydra changes directory. With `GENPLAYLIST_OUTPUT_NAME`, it evaluates that folder's checkpoint and writes results into it. |
-| `scripts/run_layout.sh` | Shared run-folder naming for both runners. |
-| `test_history_condition.py`, `test_prepared_data.py` | Tests covering all four variants, donor rules, and the manifest guard. |
+| `train_history_cond_mpd.sh <gpu> <seed>...` | Train the four MPD variants for the given seeds into `ablation-history-cond/mpd-<cond>-seed<N>` |
+| `train_history_cond_m4a.sh <gpu> <seed>...` | Same for Music4All v3-u500 (`m4a-<cond>-seed<N>`) |
+| `eval_history_cond.sh <mpd\|m4a> --gpu N [--seeds "1 2 3"] [--conds "..."] [--no-mert] [--dry-run]` | WP-C evaluation plus MERT metrics for the chosen models, skipping finished work, ending with a summary table |
 
-With `history_condition=full`, the tokens are byte-identical to the
-pre-ablation code; `test_full_matches_plain_item_encoding` checks this.
-However, `genplaylist_tokenizer.py`, `prepare_wp_c_data.py`, and
-`prepared_data.py` are fingerprinted by every prepared cache, so **all existing
-prepared directories, including Full, must be rebuilt** with this code.
+Two one-off scripts used during the experiment were kept outside the
+repository:
 
-The WP-D runtime (`backbone_runtime.py`) still encodes contexts as `full`.
-Only the Full checkpoint should be used for synthesis.
+| Script | Purpose |
+|---|---|
+| `move_mpd_history_runs.sh [--apply]` | Moved the first four dated MPD seed-1 runs to `ablation-history-cond/mpd-<cond>` |
+| `collect_results.sh [experiment]` | Bundles every model's `results/*.json` and `runs.csv` into one archive for download |
+
+MPD seed-1 models are in the unsuffixed folders `mpd-<cond>`; all later runs
+use `-seed<N>`. `eval_history_cond.sh` falls back to the unsuffixed folder for MPD
+seed 1.
 
 ## Running it
 
