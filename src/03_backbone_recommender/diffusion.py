@@ -292,7 +292,8 @@ class Diffusion(L.LightningModule):
     logs = {
       'train/grad_norm': total,
       'train/grad_clipped': torch.tensor(
-        float(clip_value is not None and float(total) > float(clip_value))),
+        float(clip_value is not None and float(total) > float(clip_value)),
+        device=total.device),
     }
     embedding = getattr(
       getattr(self.backbone, 'vocab_embed', None), 'embedding', None)
@@ -303,7 +304,9 @@ class Diffusion(L.LightningModule):
         embedding_grad)
       logs['train/grad_norm_cue_embeddings'] = torch.linalg.vector_norm(
         embedding_grad[TOKEN_LAYOUT.cue_token_start:TOKEN_LAYOUT.mask_token])
-    self.log_dict(logs, on_step=True, on_epoch=False, sync_dist=True)
+    # DDP has already averaged the gradients, so every rank holds the same
+    # values; syncing them again would only add a collective call.
+    self.log_dict(logs, on_step=True, on_epoch=False, sync_dist=False)
 
   def optimizer_step(self, *args, **kwargs):
     super().optimizer_step(*args, **kwargs)
