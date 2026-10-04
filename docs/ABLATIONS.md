@@ -9,14 +9,14 @@ and one set of runner scripts, described first.
 |---|---|---|---|
 | 1 | [Conditioning channels](#ablation-1-conditioning-channels) | Which part of the history drives predictions: latent references, cues, or just extra cue tokens? | Implemented; results in [`ABLATION_HISTORY_COND_RESULTS.md`](ABLATION_HISTORY_COND_RESULTS.md) |
 | 2 | [Cue budget](#ablation-2-cue-budget) | Does cue ranking matter, and is 8 cues a good balance of information and sequence length? | Implemented |
-| 3 | [Training schedule](#ablation-3-training-schedule-planned) | Does warming up the cue loss help over fixed loss weights from the start? | Planned |
+| 3 | [Training schedule](#ablation-3-training-schedule) | Does warming up the cue loss help over fixed loss weights from the start, through stability or only through training time? | Implemented |
 
 Contents:
 
 - [Shared setup](#shared-setup)
 - [Ablation 1: conditioning channels](#ablation-1-conditioning-channels)
 - [Ablation 2: cue budget](#ablation-2-cue-budget)
-- [Ablation 3: training schedule (planned)](#ablation-3-training-schedule-planned)
+- [Ablation 3: training schedule](#ablation-3-training-schedule)
 - [Repository changes](#repository-changes)
 
 ## Shared setup
@@ -119,7 +119,10 @@ the repository root.
 | `train_cue_budget.sh <mpd\|m4a> --gpu N --seeds "..." [--budgets]` | 2 | Train the cue-budget variants; resumes unfinished runs |
 | `eval_cue_budget.sh <mpd\|m4a> --gpu N [--seeds] [--budgets] [--no-mert] [--dry-run]` | 2 | Evaluation + MERT, with tokens and seconds per history |
 | `build_random_cue_table.py` | 2 | Derive the random-subset cue folder (called by `prepare_cue_budget.sh`) |
-| `common.sh` | all | Dataset paths and cue-budget variants (sourced) |
+| `train_training_schedule.sh <mpd\|m4a> --gpu N --seeds "..." [--schedules]` | 3 | Train the warmup, fixed, and uniform schedules with gradient-norm logging |
+| `eval_training_schedule.sh <mpd\|m4a> --gpu N [--seeds] [--schedules] [--mode final\|curve\|both] ...` | 3 | Official final evaluation + MERT, and unofficial training-curve points |
+| `export_training_curves.py` | 3 | TensorBoard scalars and evaluation points to CSV for plotting |
+| `common.sh` | all | Dataset paths, cue-budget variants, and loss schedules (sourced) |
 
 ### Evaluation outputs
 
@@ -133,6 +136,16 @@ metrics, predictions, checkpoint and prepared-data hashes, git commit, and:
   `loop_seconds`, `eval_batch_size`, `device`. Generation time covers only the
   sampling calls (synchronized on GPU), not data loading or metrics. Compare
   timings only between runs on the same GPU type with no competing jobs.
+- `evaluation.ema_enabled`, `evaluation.sampling_steps`, and
+  `evaluation.test_subset` (`{size, total, seed, indices_sha256}`, or null for
+  the full test set)
+
+Unofficial evaluations, such as training-curve points, add suffixes to the
+file name: `-raw` for raw (non-EMA) weights and `-n<N>s<S>` for a test
+subset of N histories drawn with seed S, for example
+`step-5000-steps64-evalseed1-raw-n2000s0.json`. They need
+`GENPLAYLIST_EVAL_ALLOW_PROTOCOL_OVERRIDE=true` and are marked
+`official_protocol: false`.
 
 `scripts/evaluate_mert_proxy.py` turns it into `...-mert.json` with the paper
 metrics: N1-MERT, Recall@5, M2M-MERT, Coverage@5, and 95% bootstrap intervals.
@@ -383,26 +396,152 @@ The checkout must be committed and must not change while data is prepared.
 | 0 vs 4 vs 8 vs 16 | How much does each additional block of cues add? |
 | Metric gain vs tokens and seconds per history | Is 8 a reasonable balance of information and conditioning length? |
 
-## Ablation 3: training schedule (planned)
+## Ablation 3: training schedule
 
-Compare fixed loss weights from the start of training against the cue-weight
-warm-up, in which the cue objective is introduced gradually while the
-musical-token objective stays active, with the same total steps and
-checkpoint rule. Report final performance and training curves, to separate
-better optimization stability from a difference in effective training time.
+Does introducing the cue objective gradually (warm-up) help over fixed loss
+weights from the start, and if so, is that better optimization stability or
+only a difference in effective training time? Every arm uses the same total
+steps (20,000) and the same checkpoint rule (final EMA checkpoint).
 
-Existing support to build on:
+### Variants
 
-- `GENPLAYLIST_LAYER_LOSS_CURRICULUM=false` trains with uniform weights; the
-  default `true` is the warm-up (cue weight 0.1 until step 1,000, then linear
-  to 1.0 by step 5,000), and `GENPLAYLIST_CUE_WARMUP_*` set its shape. The run
-  name and `runs.csv` record the loss variant.
-- Checkpoints are saved every 500 steps, and
-  `GENPLAYLIST_EVAL_CKPT_FILE=step-<N>.ckpt` evaluates any of them, for
-  training curves. Use curves only to describe training, never to choose a
-  checkpoint.
-- Training logs per-component unweighted NLL and the effective weights to
-  TensorBoard.
+Each target token's loss is weighted by its role. The final role weights are
+2.0 / 1.5 / 1.0 for RVQ levels 0 / 1 / 2, 0.5 for the conflict token, and 1.0
+per cue. Weights are rescaled to mean one over the active target tokens, so
+the overall loss scale never changes.
+
+| `GENPLAYLIST_LOSS_SCHEDULE` | Weights | Loss variant (`runs.csv`) | Model folder |
+|---|---|---|---|
+| `warmup` (default) | role weights; cue weight 0.1 until step 1,000, then linear to 1.0 by step 5,000 | `rvq-cue-warmup-cw0.1to1.0-s1000to5000` | `ablation-training-schedule/<ds>-warmup-seed<N>` |
+| `fixed` | role weights at their final values from step 0 | `fixed-cw1.0` | `ablation-training-schedule/<ds>-fixed-seed<N>` |
+| `uniform` | every target token 1.0 | `uniform` | `ablation-training-schedule/<ds>-uniform-seed<N>` |
+
+**Warm-up vs fixed is the comparison the question asks for:** they differ only
+in the cue-weight ramp. **Uniform** differs from both in the role weights too;
+it connects to the earlier "8 cues, uniform loss" ledger row and shows the
+effect of role weighting itself, not of the schedule.
+
+All variants use the Full 8-cue data of ablation 1 (`<prefix>-8cue-full`,
+`history_condition=full`), so nothing new is prepared. Training is
+3 schedules x 3 seeds x 2 datasets = 18 runs.
+
+### Design decisions
+
+Agreed with the supervisor:
+
+1. **All three arms are trained here, including warm-up.** The warm-up arm
+   has the same settings as the ablation 1 Full models but is retrained so
+   that every arm has gradient-norm logs (below). Its final numbers should be
+   close to Full's, which doubles as a reproducibility check; they are not
+   bit-identical, because GPU training is not deterministic.
+2. **The uniform schedule is included** as a third arm.
+3. **Training curves use reduced, unofficial settings** (below); final numbers
+   use the full official protocol.
+
+### Training curves
+
+Checkpoints are saved every 500 steps. Curve points evaluate
+`step-<K>.ckpt` for K = 1,000, 2,000, 3,000, 4,000, 5,000, 7,500, 10,000,
+15,000, and 20,000 with:
+
+- **Raw (non-EMA) weights.** Every checkpoint stores both. The EMA average
+  (decay 0.9999) remembers about the last 10,000 steps and starts from the
+  pretrained DDBC weights, so early EMA weights are still mostly the starting
+  model: about 90% at step 1,000, 82% at 2,000, 61% at 5,000, 37% at 10,000,
+  and 14% at 20,000. An EMA curve would show the averaging lag, exactly where
+  the warm-up (steps 1,000-5,000) acts. Raw weights show the model as it is at
+  each step.
+- **64 denoising steps** instead of 256, about 4x faster. All curve points of
+  all arms use the same 64 steps. The 20,000-step point is also evaluated at
+  256 steps (same raw weights and subset) to check that the reduced setting
+  keeps the ranking of the schedules.
+- **A fixed random subset of test histories:** 2,000 of 19,771 for Music4All
+  (all 941 for MPD), drawn once with seed 0 (`select_test_subset` in
+  `evaluation_protocol.py`) and identical for every checkpoint, schedule, and
+  seed, so comparisons stay paired. A random subset is used rather than the
+  first rows because the test file order may not be representative.
+
+A Music4All curve point therefore costs about 1/40 of an official
+evaluation. Curve results are marked `official_protocol: false`, carry
+`-raw` (and `-n2000s0`) in their file names, and are used only for the
+training-curve figure. Use curves only to describe training, never to choose
+a checkpoint.
+
+### Logged during training
+
+TensorBoard (`<run folder>/tensorboard/`) logs every 10 steps:
+
+- `train/layer_nll/{d0,d1,d2,conflict,cues}`: **unweighted** per-component
+  losses on the target tokens. These are the losses to compare across
+  schedules.
+- `train/loss_weight_*`: the role weights in effect.
+- `trainer/loss`: the weighted training loss. It is weighted by the schedule
+  itself, so it is **not comparable across schedules**.
+- New with `training.log_grad_norm=true` (set by
+  `train_training_schedule.sh`):
+  - `train/grad_norm`: the L2 norm of all gradients before clipping
+  - `train/grad_clipped`: 1 when that norm exceeds the clipping threshold
+    (`trainer.gradient_clip_val`, 1.0), so the step will be clipped
+  - `train/grad_norm_embeddings` and `train/grad_norm_cue_embeddings`: the
+    norm on the token-embedding table and on its cue-token rows, which the
+    pretrained DDBC model never saw
+
+`export_training_curves.py` writes these per run to
+`<experiment>/curves/<run>/train_scalars.csv` and all evaluation points to
+`<experiment>/curves/eval_points.csv`.
+
+### Caveats
+
+- Curve points are unofficial and comparable only with each other.
+- Gradient norms and the clipping indicator are recorded on logging steps
+  only (every 10th optimizer step), so the clipping rate is a sample.
+- Uniform changes the role weights as well as the schedule; do not read
+  warm-up vs uniform as a schedule effect.
+- The warm-up keeps the RVQ and conflict weights at their final values; only
+  the cue weight ramps.
+
+### Running it
+
+1. **Train** (finished runs are skipped, unfinished ones resumed; spread
+   schedules over GPUs with `--schedules`):
+
+   ```bash
+   bash scripts/ablation/train_training_schedule.sh mpd --gpu 4 --seeds "1 2 3"
+   ```
+
+   ```bash
+   bash scripts/ablation/train_training_schedule.sh m4a --gpu 4 --seeds "1 2 3"
+   ```
+
+2. **Evaluate** the final checkpoints (official + MERT) and the curve points:
+
+   ```bash
+   bash scripts/ablation/eval_training_schedule.sh mpd --gpu 4 --seeds "1 2 3" --mode both
+   ```
+
+   `--mode final` or `--mode curve` runs one part; `--curve-checkpoints`,
+   `--curve-sampling-steps`, and `--curve-examples` change the curve settings.
+   The summary prints the official table and the curve table.
+
+3. **Export** for plotting (on the server, where `tensorboard` is installed):
+
+   ```bash
+   python scripts/ablation/export_training_curves.py
+   ```
+
+### Reading the results
+
+| Observation | Interpretation |
+|---|---|
+| The fixed curve looks like the warm-up curve shifted earlier, and both end at the same final score | Training-time effect: warm-up only delays cue learning |
+| Warm-up reaches a higher plateau or better final score (paired bootstrap) | Better optimization with warm-up |
+| Fixed shows larger or spikier gradient norms, more clipping, or a temporary rise in the RVQ losses (`layer_nll/d*`) in the first few thousand steps | The cue objective destabilizes the pretrained model early; warm-up avoids it |
+| Final scores vary more across seeds for one schedule | That schedule is less stable |
+
+Report the final official metrics (mean and spread over seeds, paired
+bootstrap of fixed and uniform against warm-up), the curves (mean and seed
+range), steps to reach 90% of the final Recall@5, early gradient-norm and
+clipping statistics, and the 64-vs-256-step check.
 
 ## Repository changes
 
@@ -414,7 +553,8 @@ All changes are on branch `waikei-ablation`, on top of `aa65657` (merge of
 | `3d98434` | 2026-09-29 | Ablation 1: history conditions in the tokenizer, data preparation, validation, evaluation guard, runner flags, tests |
 | `5fd6457` | 2026-10-01 | Named run folders (`GENPLAYLIST_OUTPUT_NAME`), resume, and `runs.csv` |
 | `f42158a` | 2026-10-04 | Ablation 1 runner scripts in `scripts/ablation/` |
-| *(cue-budget commit)* | 2026-10-04 | Ablation 2: random cue table, cue-budget runners, evaluation timing, this document renamed to `ABLATIONS.md` |
+| `023bd0d` | 2026-10-04 | Ablation 2: random cue table, cue-budget runners, evaluation timing, this document renamed to `ABLATIONS.md` |
+| *(training-schedule commit)* | 2026-10-04 | Ablation 3: loss-schedule switch, gradient-norm logging, curve evaluation (raw weights, test subset), schedule runners, curve export |
 
 ### Commit `3d98434`: history-condition ablation
 
@@ -558,7 +698,7 @@ components, or empty components.
 `scripts/ablation/eval_history_cond.sh` (see
 [Runner scripts](#runner-scripts-scriptsablation)).
 
-### Cue-budget commit
+### Commit `023bd0d`: cue-budget ablation
 
 - **New `scripts/ablation/build_random_cue_table.py`** and
   **`scripts/ablation/test_build_random_cue_table.py`** (5 tests): the
@@ -575,13 +715,81 @@ components, or empty components.
 - **Docs:** `ABLATION_CONDITIONING.md` became this file; references in the
   ablation 1 scripts and `config.yaml` point here.
 
+### Training-schedule commit
+
+**`src/03_backbone_recommender/scripts/train_spotify.sh`**
+
+- New `GENPLAYLIST_LOSS_SCHEDULE` = `warmup` (default) | `fixed` | `uniform`.
+  `fixed` passes `training.layer_loss_weights.warmup.enabled=false` and records
+  the loss variant `fixed-cw<cue weight>`. `GENPLAYLIST_LAYER_LOSS_CURRICULUM`
+  still works: `false` means `uniform`, and combining it with another schedule
+  is refused.
+- New `GENPLAYLIST_LOG_GRAD_NORM` (default `false`) passes
+  `training.log_grad_norm=true`.
+- Both new options add Hydra overrides only when they differ from the
+  defaults.
+
+**`src/03_backbone_recommender/diffusion.py`**
+
+- New `on_before_optimizer_step` hook. With `training.log_grad_norm=true`, on
+  logging steps it logs `train/grad_norm` (before clipping),
+  `train/grad_clipped`, `train/grad_norm_embeddings`, and
+  `train/grad_norm_cue_embeddings`. It only reads gradients; training is
+  unchanged. With the option off (the default) it returns immediately.
+
+**`src/03_backbone_recommender/configs/config.yaml`**
+
+- `training.log_grad_norm: false`
+- `eval.max_test_examples: null` and `eval.test_subset_seed: 0`
+
+**`src/03_backbone_recommender/evaluation_protocol.py`** and **`main.py`**
+
+- New `select_test_subset(total, size, seed)`: sorted indices of a fixed
+  random subset; `size >= total` keeps every row.
+- With `eval.max_test_examples` set, `rec_eval` evaluates only that subset.
+  It requires `eval.allow_protocol_override=true` and records
+  `evaluation.test_subset` (`{size, total, seed, indices_sha256}`; null
+  otherwise) in the result JSON.
+
+**`src/03_backbone_recommender/scripts/eval_spotify.sh`**
+
+- New `GENPLAYLIST_EVAL_DISABLE_EMA`, `GENPLAYLIST_EVAL_MAX_EXAMPLES`, and
+  `GENPLAYLIST_EVAL_SUBSET_SEED`. They require
+  `GENPLAYLIST_EVAL_ALLOW_PROTOCOL_OVERRIDE=true` and add `-raw` and
+  `-n<N>s<S>` to the result file name. `eval.disable_ema` is now passed from
+  `GENPLAYLIST_EVAL_DISABLE_EMA` (default `false`, as before).
+
+**`scripts/ablation/`**
+
+- `common.sh`: new `training_schedule_variant` and `TRAINING_SCHEDULES_ALL`.
+- New `train_training_schedule.sh`, `eval_training_schedule.sh`,
+  `export_training_curves.py`, and `test_export_training_curves.py` (4 tests:
+  run-name parsing, evaluation-point rows, merging scalar events, and the
+  command on a fake experiment folder).
+
+**Tests:** `test_evaluation_protocol.py` (+2 tests): the subset is fixed per
+seed, sorted, spread over the whole test set, keeps all rows when large
+enough, and rejects invalid sizes.
+
+**Compatibility check.** The committed and the new `train_spotify.sh` and
+`eval_spotify.sh` were run side by side with a stand-in `python` that records
+its arguments, for every way the earlier ablations call them: default dated
+runs; named history-condition runs on MPD and Music4All; cue-budget runs
+including resume; the old uniform switch; 500-step smoke runs; an invalid
+value; official, mismatch-diagnostic, smoke-override, dated-fallback, and
+0-cue evaluations. All 12 produced byte-identical arguments and output.
+
 ### What did not change
 
-- The frozen protocol, model architecture, loss curriculum, and official
-  metrics.
+- The frozen protocol, model architecture, default loss curriculum, and
+  official metrics.
 - `history_condition=full` produces exactly the pre-ablation tokens.
-- The cue-budget changes touch no fingerprinted preparation code, so every
-  prepared folder built since `3d98434` stays valid.
+- The cue-budget and training-schedule changes touch no fingerprinted
+  preparation code, so every prepared folder built since `3d98434` stays
+  valid.
+- With no new variables set, `train_spotify.sh` and `eval_spotify.sh` pass
+  exactly the same arguments as before, so the ablation 1 and 2 runners
+  behave as they did.
 - The WP-D runtime (`backbone_runtime.py`) still encodes contexts as `full`
   with the ranked cue table. Only Full checkpoints should be used for
   synthesis.

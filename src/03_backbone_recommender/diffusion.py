@@ -270,6 +270,41 @@ class Diffusion(L.LightningModule):
           persistent_workers=(dl.persistent_workers if dl.num_workers > 0 else False)))
     self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
+  def on_before_optimizer_step(self, optimizer):
+    """Log gradient norms before clipping (training.log_grad_norm only).
+
+    Lightning calls this hook after gradients are accumulated and before they
+    are clipped, so ``train/grad_norm`` is the unclipped L2 norm and
+    ``train/grad_clipped`` records whether clipping will act on this step.
+    """
+    if not bool(getattr(self.config.training, 'log_grad_norm', False)):
+      return
+    every = max(int(getattr(self.trainer, 'log_every_n_steps', 1) or 1), 1)
+    if int(self.global_step) % every != 0:
+      return
+    grads = [param.grad.detach().float()
+             for param in self.parameters() if param.grad is not None]
+    if not grads:
+      return
+    total = torch.linalg.vector_norm(
+      torch.stack([torch.linalg.vector_norm(grad) for grad in grads]))
+    clip_value = getattr(self.trainer, 'gradient_clip_val', None)
+    logs = {
+      'train/grad_norm': total,
+      'train/grad_clipped': torch.tensor(
+        float(clip_value is not None and float(total) > float(clip_value))),
+    }
+    embedding = getattr(
+      getattr(self.backbone, 'vocab_embed', None), 'embedding', None)
+    if embedding is not None and embedding.grad is not None:
+      from shared.schema import TOKEN_LAYOUT
+      embedding_grad = embedding.grad.detach().float()
+      logs['train/grad_norm_embeddings'] = torch.linalg.vector_norm(
+        embedding_grad)
+      logs['train/grad_norm_cue_embeddings'] = torch.linalg.vector_norm(
+        embedding_grad[TOKEN_LAYOUT.cue_token_start:TOKEN_LAYOUT.mask_token])
+    self.log_dict(logs, on_step=True, on_epoch=False, sync_dist=True)
+
   def optimizer_step(self, *args, **kwargs):
     super().optimizer_step(*args, **kwargs)
     if self.ema:

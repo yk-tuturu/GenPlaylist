@@ -50,6 +50,10 @@ training:
   importance_sampling: False
   sampling_eps: 1e-3
   change_of_variables: False
+  # Log the pre-clipping gradient norm, the clipping indicator, and embedding
+  # gradient norms every log_every_n_steps (training-schedule ablation).
+  # Logging only; it does not change training.
+  log_grad_norm: false
   # RVQ 层级 loss 权重配置
   # Token 结构：[BOS, BOI, d0, d1, d2, conflict, c0, ..., c7, BOI, ...]
   # Layer 0 (d0) 决定粗粒度类别，最重要；conflict digit 很少被真正使用，权重最低
@@ -86,6 +90,11 @@ eval:
   # True only for diagnostics that evaluate a checkpoint on test contexts of a
   # different history_condition (e.g. Full on shuffled_cue); marked unofficial.
   allow_history_condition_mismatch: false
+  # Training-curve points only: evaluate a fixed random subset of this many
+  # test histories (null = all). Requires allow_protocol_override; the subset
+  # is drawn once from test_subset_seed and is identical across checkpoints.
+  max_test_examples: null
+  test_subset_seed: 0
   disable_ema: False
   compute_generative_perplexity: False
   perplexity_batch_size: 8

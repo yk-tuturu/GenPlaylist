@@ -36,7 +36,7 @@ import utils  # 工具函数集合
 from dataset import AbstractDataset  # 抽象数据集类，负责加载原始数据
 from warmstart import apply_ddbc_warmstart
 from prepared_data import load_prepared_tokenized_dataset
-from evaluation_protocol import OFFICIAL_EVALUATION_PROTOCOL
+from evaluation_protocol import OFFICIAL_EVALUATION_PROTOCOL, select_test_subset
 
 
 # ============ HuggingFace Dataset包装器 ============
@@ -236,6 +236,27 @@ def _rec_eval(config, logger, tokenizer, tokenized_dataset):
         f"{checkpoint_history_condition!r} but the test contexts use "
         f"{data_history_condition!r}. Set "
         "eval.allow_history_condition_mismatch=true for a diagnostic run.")
+  test_subset = None
+  max_test_examples = config.eval.get('max_test_examples', None)
+  if max_test_examples is not None:
+    if not allow_protocol_override:
+      raise ValueError(
+          "eval.max_test_examples is for unofficial training-curve points; "
+          "set eval.allow_protocol_override=true")
+    subset_seed = int(config.eval.get('test_subset_seed', 0))
+    total_examples = len(tokenized_dataset['test'])
+    indices = select_test_subset(total_examples, int(max_test_examples), subset_seed)
+    tokenized_dataset = dict(tokenized_dataset)
+    tokenized_dataset['test'] = tokenized_dataset['test'].select(indices)
+    test_subset = {
+        'size': len(indices),
+        'total': total_examples,
+        'seed': subset_seed,
+        'indices_sha256': hashlib.sha256(
+            json.dumps(indices).encode('utf-8')).hexdigest(),
+    }
+    logger.info(f'Evaluating a fixed subset of {len(indices)}/{total_examples} '
+                f'test histories (seed {subset_seed}).')
 
   # 加载训练好的模型和评估器
   model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
@@ -442,6 +463,7 @@ def _rec_eval(config, logger, tokenizer, tokenized_dataset):
               'test_contexts': data_history_condition,
               'checkpoint': checkpoint_history_condition,
           },
+          'test_subset': test_subset,
           'active_cue_tokens': int(tokenizer.active_cues),
           'tokens_per_sequence': int(config.model.length),
           'timing': timing,

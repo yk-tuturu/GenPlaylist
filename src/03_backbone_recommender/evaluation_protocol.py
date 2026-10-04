@@ -48,3 +48,20 @@ class OfficialEvaluationProtocol:
 
 
 OFFICIAL_EVALUATION_PROTOCOL = OfficialEvaluationProtocol()
+
+
+def select_test_subset(total: int, size: int, seed: int) -> list[int]:
+    """Sorted indices of a fixed random subset of the unified test set.
+
+    Used only for unofficial training-curve evaluations. The subset depends
+    only on (total, size, seed), so every checkpoint, schedule, and training
+    seed is scored on the same histories. ``size >= total`` keeps all rows.
+    """
+    import numpy as np
+
+    if total <= 0 or size <= 0:
+        raise ValueError(f"Invalid test subset: total={total}, size={size}")
+    if size >= total:
+        return list(range(total))
+    rng = np.random.default_rng(seed)
+    return sorted(int(index) for index in rng.choice(total, size=size, replace=False))

@@ -61,14 +61,53 @@ case "$STRUCTURE_CONDITIONING" in
 esac
 
 case "$LOSS_CURRICULUM" in
-  true)
+  true|false) ;;
+  *)
+    echo "GENPLAYLIST_LAYER_LOSS_CURRICULUM must be true or false" >&2
+    exit 2
+    ;;
+esac
+
+# Loss schedule (training-schedule ablation):
+#   warmup   role weights; cue weight warmed up (the default, as before)
+#   fixed    role weights at their final values from step 0
+#   uniform  every target token weighted 1.0
+# GENPLAYLIST_LAYER_LOSS_CURRICULUM=false remains an alias for uniform.
+LOSS_SCHEDULE="${GENPLAYLIST_LOSS_SCHEDULE:-}"
+if [[ -z "$LOSS_SCHEDULE" ]]; then
+  if [[ "$LOSS_CURRICULUM" == false ]]; then LOSS_SCHEDULE=uniform; else LOSS_SCHEDULE=warmup; fi
+elif [[ "$LOSS_CURRICULUM" == false && "$LOSS_SCHEDULE" != uniform ]]; then
+  echo "GENPLAYLIST_LAYER_LOSS_CURRICULUM=false conflicts with GENPLAYLIST_LOSS_SCHEDULE=$LOSS_SCHEDULE" >&2
+  exit 2
+fi
+LOSS_SCHEDULE_ARGS=()
+case "$LOSS_SCHEDULE" in
+  warmup)
+    LOSS_CURRICULUM=true
     LOSS_VARIANT="rvq-cue-warmup-cw${CUE_WARMUP_INITIAL_WEIGHT}to${CUE_WEIGHT}-s${CUE_WARMUP_START_STEP}to${CUE_WARMUP_END_STEP}"
     ;;
-  false)
+  fixed)
+    LOSS_CURRICULUM=true
+    LOSS_VARIANT="fixed-cw${CUE_WEIGHT}"
+    LOSS_SCHEDULE_ARGS=(training.layer_loss_weights.warmup.enabled=false)
+    ;;
+  uniform)
+    LOSS_CURRICULUM=false
     LOSS_VARIANT="uniform"
     ;;
   *)
-    echo "GENPLAYLIST_LAYER_LOSS_CURRICULUM must be true or false" >&2
+    echo "GENPLAYLIST_LOSS_SCHEDULE must be warmup, fixed, or uniform" >&2
+    exit 2
+    ;;
+esac
+
+LOG_GRAD_NORM="${GENPLAYLIST_LOG_GRAD_NORM:-false}"
+GRAD_NORM_ARGS=()
+case "$LOG_GRAD_NORM" in
+  true) GRAD_NORM_ARGS=(training.log_grad_norm=true) ;;
+  false) ;;
+  *)
+    echo "GENPLAYLIST_LOG_GRAD_NORM must be true or false" >&2
     exit 2
     ;;
 esac
@@ -163,6 +202,8 @@ python main.py \
   eval.compute_generative_perplexity=False \
   sampling.steps=25 \
   "${CHECKPOINT_ARGS[@]}" \
+  ${LOSS_SCHEDULE_ARGS[@]+"${LOSS_SCHEDULE_ARGS[@]}"} \
+  ${GRAD_NORM_ARGS[@]+"${GRAD_NORM_ARGS[@]}"} \
   ${RUN_DIR_ARGS[@]+"${RUN_DIR_ARGS[@]}"}
 
 # Append one row per finished named run to the shared run registry.

@@ -3,6 +3,7 @@
 # Expects REPO. Provides:
 #   ablation_dataset <mpd|m4a>     dataset paths (DATA_CONFIG, DATA_ROOT, ...)
 #   cue_budget_variant <budget>    one cue-budget variant (ACTIVE_CUES, ...)
+#   training_schedule_variant <s>  one loss schedule (warmup, fixed, uniform)
 #   ablation_env_is_clean          refuse leftover GENPLAYLIST_* variables
 
 OUT=$REPO/src/03_backbone_recommender/outputs
@@ -80,6 +81,27 @@ cue_budget_run_name() {
     name=$RUN_PREFIX
   fi
   echo "$name"
+}
+
+TRAINING_SCHEDULES_ALL="warmup fixed uniform"
+
+# Sets, for one loss schedule of the current dataset (all use the Full 8-cue
+# data from the history-conditioning ablation; all three arms are trained
+# here, with gradient-norm logging):
+#   SCHEDULE  ACTIVE_CUES  VARIANT_CUE_ROOT  PREPARED  TOKENS  RUN_PREFIX
+training_schedule_variant() {
+  case "$1" in
+    warmup|fixed|uniform) SCHEDULE=$1 ;;
+    *)
+      echo "Unknown loss schedule: $1 (use: $TRAINING_SCHEDULES_ALL)" >&2
+      return 2
+      ;;
+  esac
+  ACTIVE_CUES=8
+  VARIANT_CUE_ROOT=$CUE_ROOT
+  PREPARED=$PREPARED_PREFIX-8cue-full
+  TOKENS=262
+  RUN_PREFIX=ablation-training-schedule/$DATASET-$SCHEDULE
 }
 
 ablation_env_is_clean() {
