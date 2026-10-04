@@ -172,7 +172,7 @@ active_cue_tokens: 8
 # Conditioning-channel ablation of the 15 reference items (targets are never
 # changed): full / latent_only / cue_only / shuffled_cue. Each value needs a
 # prepared dataset built with the same --history-condition. See
-# docs/ABLATION_CONDITIONING.md.
+# docs/ABLATIONS.md.
 history_condition: full
 feature_type: clhe
 sent_emb_pca: -1

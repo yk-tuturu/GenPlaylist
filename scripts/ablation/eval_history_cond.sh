@@ -15,7 +15,7 @@
 # Models are read from outputs/ablation-history-cond/<mpd|m4a>-<cond>-seed<N>.
 # For MPD seed 1, the older unsuffixed folder mpd-<cond> is used if present.
 # Finished evaluations and MERT outputs are skipped, so re-running is safe.
-# See docs/ABLATION_CONDITIONING.md.
+# See docs/ABLATIONS.md.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

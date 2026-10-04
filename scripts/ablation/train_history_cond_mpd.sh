@@ -7,7 +7,7 @@
 #
 # Runs go to outputs/ablation-history-cond/mpd-<cond>-seed<N> and are logged in
 # outputs/runs.csv. Finished runs are refused by train_spotify.sh and skipped.
-# See docs/ABLATION_CONDITIONING.md.
+# See docs/ABLATIONS.md.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

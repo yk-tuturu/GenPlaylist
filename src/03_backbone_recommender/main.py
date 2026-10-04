@@ -256,6 +256,10 @@ def _rec_eval(config, logger, tokenizer, tokenized_dataset):
 
   model.eval()  # 设置模型为评估模式（关闭dropout等）
   all_results = defaultdict(list)  # 存储所有批次的评估结果
+  # Inference cost for the cue-budget trade-off: generation time excludes
+  # data loading and metric computation.
+  generation_seconds = 0.0
+  loop_started = time.perf_counter()
 
   # 不计算梯度
   with torch.no_grad():
@@ -314,6 +318,9 @@ def _rec_eval(config, logger, tokenizer, tokenized_dataset):
       text_samples = torch.zeros(
           (input_ids.shape[0], eval_num_samples, stride_length), dtype=torch.long)
 
+      if torch.cuda.is_available():
+        torch.cuda.synchronize()
+      generation_started = time.perf_counter()
       generated_items = model.restore_model_and_sample_items(
           input_ids=input_ids,
           num_items=num_items,
@@ -323,12 +330,27 @@ def _rec_eval(config, logger, tokenizer, tokenized_dataset):
           sigma_c2=sigma_c2,
           sequence_mask=batch.get('sequence_mask'),
       )
+      if torch.cuda.is_available():
+        torch.cuda.synchronize()
+      generation_seconds += time.perf_counter() - generation_started
       text_samples[:, 0, :] = generated_items.detach().cpu()
 
       # 计算该批次的推荐指标
       result = evaluator.calculate_metrics(text_samples, labels)
       for key, value in result.items():
           all_results[key].append(value)
+
+  loop_seconds = time.perf_counter() - loop_started
+  test_examples = len(tokenized_dataset['test'])
+  timing = {
+      'generation_seconds': round(generation_seconds, 3),
+      'generation_seconds_per_history': round(
+          generation_seconds / max(test_examples, 1), 6),
+      'loop_seconds': round(loop_seconds, 3),
+      'eval_batch_size': int(config['eval_batch_size']),
+      'device': (torch.cuda.get_device_name()
+                 if torch.cuda.is_available() else 'cpu'),
+  }
 
   # 汇总所有批次的结果
   output_results = OrderedDict()
@@ -420,6 +442,9 @@ def _rec_eval(config, logger, tokenizer, tokenized_dataset):
               'test_contexts': data_history_condition,
               'checkpoint': checkpoint_history_condition,
           },
+          'active_cue_tokens': int(tokenizer.active_cues),
+          'tokens_per_sequence': int(config.model.length),
+          'timing': timing,
           'official_protocol': (
               not allow_protocol_override and not history_condition_mismatch),
       },
