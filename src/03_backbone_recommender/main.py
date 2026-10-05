@@ -36,7 +36,8 @@ import utils  # 工具函数集合
 from dataset import AbstractDataset  # 抽象数据集类，负责加载原始数据
 from warmstart import apply_ddbc_warmstart
 from prepared_data import load_prepared_tokenized_dataset
-from evaluation_protocol import OFFICIAL_EVALUATION_PROTOCOL, select_test_subset
+from evaluation_protocol import (
+    OFFICIAL_EVALUATION_PROTOCOL, history_mask_positions, select_test_subset)
 
 
 # ============ HuggingFace Dataset包装器 ============
@@ -258,6 +259,41 @@ def _rec_eval(config, logger, tokenizer, tokenized_dataset):
     logger.info(f'Evaluating a fixed subset of {len(indices)}/{total_examples} '
                 f'test histories (seed {subset_seed}).')
 
+  # Model study A: keep only the most recent k references and blank the older
+  # ones with the history-condition null tokens (layout unchanged).
+  history_length = None
+  history_mask = None
+  reference_items = int(config.protocol.eval_reference_items)
+  configured_history_length = config.eval.get('history_length', None)
+  if configured_history_length is not None:
+    keep = int(configured_history_length)
+    if not 1 <= keep <= reference_items:
+      raise ValueError(
+          f"eval.history_length must be in 1..{reference_items}, got {keep}")
+    if (getattr(config.sampling, 'cfg_enabled', False)
+        or getattr(config.sampling, 'structure_conditioning', False)):
+      raise ValueError(
+          "eval.history_length blanks tokens only; it is not supported with "
+          "CFG or structure conditioning, which also read reference statistics")
+    if keep < reference_items:
+      from genplaylist_tokenizer import CUE_NULL_TOKEN, SEMANTIC_NULL_TOKEN
+      semantic_positions, cue_positions = history_mask_positions(
+          reference_items=reference_items,
+          tokens_per_item=tokenizer.tokens_per_item,
+          semantic_tokens=tokenizer.n_digit + 1,
+          keep=keep)
+      history_mask = (
+          torch.as_tensor(semantic_positions, dtype=torch.long),
+          torch.as_tensor(cue_positions, dtype=torch.long),
+          SEMANTIC_NULL_TOKEN, CUE_NULL_TOKEN)
+      history_length = {
+          'kept_references': keep,
+          'masked_references': reference_items - keep,
+          'kept': 'most_recent',
+      }
+      logger.info(f'History length {keep}: blanking the {reference_items - keep} '
+                  'oldest references.')
+
   # 加载训练好的模型和评估器
   model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
   evaluator = Evaluator(config['evaluator'], tokenizer)
@@ -286,6 +322,17 @@ def _rec_eval(config, logger, tokenizer, tokenized_dataset):
   with torch.no_grad():
     for batch in tqdm(test_ds, desc="Evaluating", ncols=100):
       input_ids = batch['input_ids']  # 输入的bundle前半部分
+      if history_mask is not None:
+        expected_length = 2 + reference_items * tokenizer.tokens_per_item
+        if input_ids.shape[1] != expected_length:
+          raise ValueError(
+              f"History masking expects {expected_length}-token contexts, "
+              f"got {input_ids.shape[1]}")
+        semantic_positions, cue_positions, semantic_null, cue_null = history_mask
+        input_ids = input_ids.clone()
+        input_ids[:, semantic_positions] = semantic_null
+        if cue_positions.numel():
+          input_ids[:, cue_positions] = cue_null
       labels = batch.get('labels')  # 标签是bundle的后半部分
       if labels is None:
         raise ValueError("rec_eval requires tokenizer-provided ground-truth labels")
@@ -464,11 +511,13 @@ def _rec_eval(config, logger, tokenizer, tokenized_dataset):
               'checkpoint': checkpoint_history_condition,
           },
           'test_subset': test_subset,
+          'history_length': history_length,
           'active_cue_tokens': int(tokenizer.active_cues),
           'tokens_per_sequence': int(config.model.length),
           'timing': timing,
           'official_protocol': (
-              not allow_protocol_override and not history_condition_mismatch),
+              not allow_protocol_override and not history_condition_mismatch
+              and history_length is None),
       },
       'metrics': dict(output_results),
       'predictions': {

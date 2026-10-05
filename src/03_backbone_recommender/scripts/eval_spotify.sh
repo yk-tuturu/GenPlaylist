@@ -83,13 +83,26 @@ if [[ ( "$DISABLE_EMA" == true || -n "$MAX_EXAMPLES" ) && "$ALLOW_PROTOCOL_OVERR
   echo "Raw weights and test subsets are unofficial; set GENPLAYLIST_EVAL_ALLOW_PROTOCOL_OVERRIDE=true" >&2
   exit 2
 fi
+# Model study A: GENPLAYLIST_EVAL_HISTORY_LENGTH=k keeps the most recent k
+# references (1-15) and blanks the rest. It is a study variant, not an
+# official result, but needs no protocol override.
+HISTORY_LENGTH="${GENPLAYLIST_EVAL_HISTORY_LENGTH:-}"
+if [[ -n "$HISTORY_LENGTH" ]] && ! { [[ "$HISTORY_LENGTH" =~ ^[0-9]+$ ]] \
+     && (( HISTORY_LENGTH >= 1 && HISTORY_LENGTH <= 15 )); }; then
+  echo "GENPLAYLIST_EVAL_HISTORY_LENGTH must be an integer from 1 to 15" >&2
+  exit 2
+fi
 CURVE_ARGS=()
 CURVE_SUFFIX=""
+if [[ -n "$HISTORY_LENGTH" && "$HISTORY_LENGTH" != 15 ]]; then
+  CURVE_ARGS+=(eval.history_length="$HISTORY_LENGTH")
+  CURVE_SUFFIX+="-hist${HISTORY_LENGTH}"
+fi
 if [[ "$DISABLE_EMA" == true ]]; then
   CURVE_SUFFIX+="-raw"
 fi
 if [[ -n "$MAX_EXAMPLES" ]]; then
-  CURVE_ARGS=(eval.max_test_examples="$MAX_EXAMPLES" eval.test_subset_seed="$SUBSET_SEED")
+  CURVE_ARGS+=(eval.max_test_examples="$MAX_EXAMPLES" eval.test_subset_seed="$SUBSET_SEED")
   CURVE_SUFFIX+="-n${MAX_EXAMPLES}s${SUBSET_SEED}"
 fi
 

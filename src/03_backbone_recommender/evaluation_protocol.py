@@ -50,6 +50,32 @@ class OfficialEvaluationProtocol:
 OFFICIAL_EVALUATION_PROTOCOL = OfficialEvaluationProtocol()
 
 
+def history_mask_positions(
+    *, reference_items: int, tokens_per_item: int, semantic_tokens: int, keep: int,
+) -> tuple[list[int], list[int]]:
+    """Context positions to blank so only the most recent ``keep`` references remain.
+
+    The context is ``[BOS, reference blocks..., EOS]``; each block is
+    ``[BOI, semantic tokens..., cue tokens...]``. The oldest
+    ``reference_items - keep`` blocks are blanked: their semantic (RVQ +
+    conflict) positions and their cue positions are returned separately so the
+    caller can write the matching null token into each. BOI tokens stay, so the
+    layout and the target positions are unchanged.
+    """
+    if not 1 <= keep <= reference_items:
+        raise ValueError(f"keep must be in 1..{reference_items}, got {keep}")
+    if semantic_tokens < 1 or tokens_per_item < 1 + semantic_tokens:
+        raise ValueError(
+            f"Invalid item layout: tokens_per_item={tokens_per_item}, "
+            f"semantic_tokens={semantic_tokens}")
+    semantic, cues = [], []
+    for block in range(reference_items - keep):
+        start = 1 + block * tokens_per_item
+        semantic.extend(range(start + 1, start + 1 + semantic_tokens))
+        cues.extend(range(start + 1 + semantic_tokens, start + tokens_per_item))
+    return semantic, cues
+
+
 def select_test_subset(total: int, size: int, seed: int) -> list[int]:
     """Sorted indices of a fixed random subset of the unified test set.
 

@@ -95,6 +95,10 @@ eval:
   # is drawn once from test_subset_seed and is identical across checkpoints.
   max_test_examples: null
   test_subset_seed: 0
+  # Model study A: keep only the most recent k of the 15 references and blank
+  # the older ones with the null tokens (null = keep all). Results with k < 15
+  # are marked official_protocol=false. See docs/model_study.md.
+  history_length: null
   disable_ema: False
   compute_generative_perplexity: False
   perplexity_batch_size: 8

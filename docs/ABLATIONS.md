@@ -3,7 +3,9 @@
 This document covers the required ablations of the GenPlaylist backbone: what
 each one tests, how it is implemented, and how to run it on MPD and
 Music4All-Onion. All of them share one frozen protocol, one run-folder layout,
-and one set of runner scripts, described first.
+and one set of runner scripts, described first. The model studies (available
+history, denoising steps, initialization) are in
+[`model_study.md`](model_study.md).
 
 | # | Ablation | Question | Status |
 |---|---|---|---|
@@ -139,6 +141,9 @@ metrics, predictions, checkpoint and prepared-data hashes, git commit, and:
 - `evaluation.ema_enabled`, `evaluation.sampling_steps`, and
   `evaluation.test_subset` (`{size, total, seed, indices_sha256}`, or null for
   the full test set)
+- `evaluation.history_length`: null, or the reference-masking settings of
+  model study A ([`model_study.md`](model_study.md)), whose files end in
+  `-hist<k>`
 
 Unofficial evaluations, such as training-curve points, add suffixes to the
 file name: `-raw` for raw (non-EMA) weights and `-n<N>s<S>` for a test
@@ -486,6 +491,12 @@ TensorBoard (`<run folder>/tensorboard/`) logs every 10 steps:
     norm on the token-embedding table and on its cue-token rows, which the
     pretrained DDBC model never saw
 
+  The hook runs after gradient accumulation and before clipping, and only on
+  logging steps. All four values are computed on the GPU from gradients that
+  DDP has already averaged across GPUs, so they are identical on every GPU and
+  are logged without a cross-GPU sync. Reading the gradients does not change
+  training.
+
 `export_training_curves.py` writes these per run to
 `<experiment>/curves/<run>/train_scalars.csv` and all evaluation points to
 `<experiment>/curves/eval_points.csv`.
@@ -554,7 +565,8 @@ All changes are on branch `waikei-ablation`, on top of `aa65657` (merge of
 | `5fd6457` | 2026-10-01 | Named run folders (`GENPLAYLIST_OUTPUT_NAME`), resume, and `runs.csv` |
 | `f42158a` | 2026-10-04 | Ablation 1 runner scripts in `scripts/ablation/` |
 | `023bd0d` | 2026-10-04 | Ablation 2: random cue table, cue-budget runners, evaluation timing, this document renamed to `ABLATIONS.md` |
-| *(training-schedule commit)* | 2026-10-04 | Ablation 3: loss-schedule switch, gradient-norm logging, curve evaluation (raw weights, test subset), schedule runners, curve export |
+| `ec97ffd` | 2026-10-04 | Ablation 3: loss-schedule switch, gradient-norm logging, curve evaluation (raw weights, test subset), schedule runners, curve export |
+| `aa1e646` | 2026-10-05 | Fix: gradient-norm logging crashed under DDP |
 
 ### Commit `3d98434`: history-condition ablation
 
@@ -715,7 +727,7 @@ components, or empty components.
 - **Docs:** `ABLATION_CONDITIONING.md` became this file; references in the
   ablation 1 scripts and `config.yaml` point here.
 
-### Training-schedule commit
+### Commit `ec97ffd`: training-schedule ablation
 
 **`src/03_backbone_recommender/scripts/train_spotify.sh`**
 
@@ -778,6 +790,21 @@ runs; named history-condition runs on MPD and Music4All; cue-budget runs
 including resume; the old uniform switch; 500-step smoke runs; an invalid
 value; official, mismatch-diagnostic, smoke-override, dated-fallback, and
 0-cue evaluations. All 12 produced byte-identical arguments and output.
+
+### Commit `aa1e646`: gradient-norm logging under DDP
+
+The first server smoke run of `ec97ffd` with `GENPLAYLIST_LOG_GRAD_NORM=true`
+failed at the first logging step with `RuntimeError: No backend type
+associated with device type cpu`. Training uses Lightning's DDP strategy even
+on one GPU, and the hook logged `train/grad_clipped` as a CPU tensor with
+`sync_dist=True`, which the GPU all-reduce cannot handle.
+
+- **`src/03_backbone_recommender/diffusion.py`:** `train/grad_clipped` is
+  created on the gradients' device, and the gradient-norm values are logged
+  with `sync_dist=False`. DDP has already averaged the gradients, so every GPU
+  holds the same values and syncing them again was unnecessary.
+- Runs without `GENPLAYLIST_LOG_GRAD_NORM=true`, including every ablation 1
+  and 2 run, never reached this code and were not affected.
 
 ### What did not change
 

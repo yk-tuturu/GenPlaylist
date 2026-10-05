@@ -1,6 +1,7 @@
 """Dependency-light checks for official stochastic evaluation settings."""
 
-from evaluation_protocol import OFFICIAL_EVALUATION_PROTOCOL, select_test_subset
+from evaluation_protocol import (
+    OFFICIAL_EVALUATION_PROTOCOL, history_mask_positions, select_test_subset)
 
 
 def test_official_stochastic_eval_settings_are_frozen():
@@ -54,6 +55,39 @@ def test_test_subset_keeps_all_rows_when_large_enough_and_rejects_nonsense():
         except ValueError:
             continue
         raise AssertionError(f"total={total}, size={size} should be rejected")
+
+
+def test_history_mask_blanks_only_the_oldest_reference_payloads():
+    # 8-cue layout: 13 tokens per item, BOI + 4 semantic + 8 cues.
+    semantic, cues = history_mask_positions(
+        reference_items=15, tokens_per_item=13, semantic_tokens=4, keep=5)
+    assert len(semantic) == 10 * 4 and len(cues) == 10 * 8
+    assert semantic[:4] == [2, 3, 4, 5] and cues[:8] == list(range(6, 14))
+    boi_positions = {1 + block * 13 for block in range(15)}
+    assert not boi_positions & (set(semantic) | set(cues))
+    # The last blanked block is block 9; blocks 10-14 (the most recent five)
+    # and EOS are untouched.
+    assert max(semantic + cues) == 1 + 9 * 13 + 12
+    context_length = 2 + 15 * 13
+    assert max(semantic + cues) < context_length - 1 - 5 * 13
+
+
+def test_history_mask_edges_and_zero_cue_layout():
+    assert history_mask_positions(
+        reference_items=15, tokens_per_item=13, semantic_tokens=4, keep=15) == ([], [])
+    semantic, cues = history_mask_positions(
+        reference_items=15, tokens_per_item=13, semantic_tokens=4, keep=1)
+    assert len(semantic) == 14 * 4 and len(cues) == 14 * 8
+    semantic, cues = history_mask_positions(
+        reference_items=15, tokens_per_item=5, semantic_tokens=4, keep=10)
+    assert len(semantic) == 5 * 4 and cues == []
+    for keep in (0, 16):
+        try:
+            history_mask_positions(
+                reference_items=15, tokens_per_item=13, semantic_tokens=4, keep=keep)
+        except ValueError:
+            continue
+        raise AssertionError(f"keep={keep} should be rejected")
 
 
 if __name__ == "__main__":
