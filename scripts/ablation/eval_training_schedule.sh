@@ -65,7 +65,7 @@ LAST_CURVE_POINT=${CURVE_CHECKPOINTS##* }
 CURVE_SUFFIX="-raw"
 [[ "$CURVE_EXAMPLES" != all ]] && CURVE_SUFFIX+="-n${CURVE_EXAMPLES}s${SUBSET_SEED}"
 
-ran=() skipped=() failed=()
+ran=() skipped=() failed=() pending=()
 
 # eval_one <name> <checkpoint file> <sampling steps> <official:true|false>
 eval_one() {
@@ -73,10 +73,31 @@ eval_one() {
   local label=${ckpt_file%.ckpt} suffix=""
   [[ "$official" == false ]] && suffix=$CURVE_SUFFIX
   local result=$OUT/$name/results/$label-steps$steps-evalseed1$suffix.json
+  local ckpt=$OUT/$name/checkpoints/$ckpt_file ready=false
+  # last.ckpt needs the finished run; step-<K>.ckpt needs training to be past K.
+  if [[ "$ckpt_file" == last.ckpt ]]; then
+    run_is_finished "$name" && ready=true
+  else
+    checkpoint_is_settled "$name" "${label#step-}" && ready=true
+  fi
+  if [[ "$ready" != true ]]; then
+    if [[ -f "$result" ]]; then
+      echo "  STALE: $label @$steps was evaluated before its checkpoint was final; delete $result and re-run"
+      failed+=("$name $label@$steps (stale result)")
+    else
+      echo "  $label @$steps: not finished training yet; skipping"
+      pending+=("$name $label@$steps")
+    fi
+    return 1
+  fi
+  if result_is_stale "$result" "$ckpt"; then
+    echo "  STALE: $result is older than $ckpt_file; delete it and re-run"
+    failed+=("$name $label@$steps (stale result)"); return 1
+  fi
   if [[ -f "$result" ]]; then
     echo "  $label @$steps: already done"; skipped+=("$name $label@$steps"); return 0
   fi
-  if [[ ! -f "$OUT/$name/checkpoints/$ckpt_file" ]]; then
+  if [[ ! -f "$ckpt" ]]; then
     echo "  $label: no checkpoint $ckpt_file; skipping"; failed+=("$name $ckpt_file (missing)"); return 1
   fi
   if [[ "$DRY_RUN" == true ]]; then
@@ -193,7 +214,10 @@ PY
     done
   done
 fi
-echo "ran: ${#ran[@]}  already done: ${#skipped[@]}  failed: ${#failed[@]}"
+echo "ran: ${#ran[@]}  already done: ${#skipped[@]}  not finished: ${#pending[@]}  failed: ${#failed[@]}"
+if [[ ${#pending[@]} -gt 0 ]]; then
+  printf '  not finished training (re-run later): %s\n' "${pending[@]}"
+fi
 if [[ ${#failed[@]} -gt 0 ]]; then
   printf '  failed: %s\n' "${failed[@]}"
   exit 1

@@ -44,7 +44,7 @@ if [[ "$RUN_MERT" == true && ! -f "$MERT_DIR/mert_manifest.json" ]]; then
   echo "Missing MERT folder: $MERT_DIR (or pass --no-mert)" >&2; exit 1
 fi
 
-ran=() skipped=() failed=()
+ran=() skipped=() failed=() pending=()
 for seed in $SEEDS; do
   for budget in $BUDGETS; do
     cue_budget_variant "$budget"
@@ -54,7 +54,19 @@ for seed in $SEEDS; do
     mert=${result%.json}-mert.json
     echo "=== $(date '+%F %T')  $DATASET  budget $budget  seed $seed  ($name)"
 
-    if [[ -f "$result" ]]; then
+    if ! run_is_finished "$name"; then
+      if [[ -f "$result" ]]; then
+        echo "  STALE: $result was evaluated before training finished; delete it and re-run"
+        failed+=("$name (stale result)")
+      else
+        echo "  not finished training yet (no runs.csv row or step-$FINAL_STEP.ckpt); skipping"
+        pending+=("$name")
+      fi
+      continue
+    elif result_is_stale "$result" "$ckpt"; then
+      echo "  STALE: $result is older than $ckpt; delete it and re-run"
+      failed+=("$name (stale result)"); continue
+    elif [[ -f "$result" ]]; then
       echo "  eval: already done"; skipped+=("$name eval")
     elif [[ ! -f "$ckpt" ]]; then
       echo "  no checkpoint at $ckpt; skipping"; failed+=("$name (no checkpoint)"); continue
@@ -115,7 +127,10 @@ print(f"{row} {m['n1_mert']:9.4f} {m['recall_at_5']:9.4f} {m['m2m_mert']:9.4f} "
 PY
   done
 done
-echo "ran: ${#ran[@]}  already done: ${#skipped[@]}  failed: ${#failed[@]}"
+echo "ran: ${#ran[@]}  already done: ${#skipped[@]}  not finished: ${#pending[@]}  failed: ${#failed[@]}"
+if [[ ${#pending[@]} -gt 0 ]]; then
+  printf '  not finished training (re-run later): %s\n' "${pending[@]}"
+fi
 if [[ ${#failed[@]} -gt 0 ]]; then
   printf '  failed: %s\n' "${failed[@]}"
   exit 1

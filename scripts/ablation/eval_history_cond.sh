@@ -19,6 +19,9 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Only for run_is_finished / result_is_stale; the settings below are this
+# script's own.
+source "$REPO/scripts/ablation/common.sh"
 OUT=$REPO/src/03_backbone_recommender/outputs
 EVAL_SCRIPT=$REPO/src/03_backbone_recommender/scripts/eval_spotify.sh
 RESULT_FILE=last-steps256-evalseed1.json
@@ -89,7 +92,7 @@ run_name() {
   echo "$name"
 }
 
-ran=() skipped=() failed=()
+ran=() skipped=() failed=() pending=()
 for seed in $SEEDS; do
   for cond in $CONDS; do
     name=$(run_name "$cond" "$seed")
@@ -99,6 +102,20 @@ for seed in $SEEDS; do
     prepared=$PREPARED_PREFIX-$cond
     echo "=== $(date '+%F %T')  $DATASET  $cond  seed $seed  ($name)"
 
+    if ! run_is_finished "$name"; then
+      if [[ -f "$result" ]]; then
+        echo "  STALE: $result was evaluated before training finished; delete it and re-run"
+        failed+=("$name (stale result)")
+      else
+        echo "  not finished training yet (no runs.csv row or step-$FINAL_STEP.ckpt); skipping"
+        pending+=("$name")
+      fi
+      continue
+    fi
+    if result_is_stale "$result" "$ckpt"; then
+      echo "  STALE: $result is older than $ckpt; delete it and re-run"
+      failed+=("$name (stale result)"); continue
+    fi
     if [[ ! -f "$ckpt" ]]; then
       echo "  no checkpoint at $ckpt; skipping"; failed+=("$name (no checkpoint)"); continue
     fi
@@ -153,7 +170,10 @@ for seed in $SEEDS; do
     fi
   done
 done
-echo "ran: ${#ran[@]}  already done: ${#skipped[@]}  failed: ${#failed[@]}"
+echo "ran: ${#ran[@]}  already done: ${#skipped[@]}  not finished: ${#pending[@]}  failed: ${#failed[@]}"
+if [[ ${#pending[@]} -gt 0 ]]; then
+  printf '  not finished training (re-run later): %s\n' "${pending[@]}"
+fi
 if [[ ${#failed[@]} -gt 0 ]]; then
   printf '  failed: %s\n' "${failed[@]}"
   exit 1

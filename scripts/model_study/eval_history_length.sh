@@ -53,14 +53,26 @@ result_name() {  # official file for k = 15, -hist<k> otherwise
   else echo "last-steps256-evalseed1-hist$1.json"; fi
 }
 
-ran=() skipped=() failed=()
+ran=() skipped=() failed=() pending=()
 for seed in $SEEDS; do
   name=$(cue_budget_run_name "$seed")
   for k in $LENGTHS; do
     result=$OUT/$name/results/$(result_name "$k")
     mert=${result%.json}-mert.json
     echo "=== $(date '+%F %T')  $DATASET  seed $seed  k=$k  ($name)"
-    if [[ -f "$result" ]]; then
+    if ! run_is_finished "$name"; then
+      if [[ -f "$result" ]]; then
+        echo "  STALE: $result was evaluated before training finished; delete it and re-run"
+        failed+=("$name k=$k (stale result)")
+      else
+        echo "  not finished training yet (no runs.csv row or step-$FINAL_STEP.ckpt); skipping"
+        pending+=("$name k=$k")
+      fi
+      continue
+    elif result_is_stale "$result" "$OUT/$name/checkpoints/last.ckpt"; then
+      echo "  STALE: $result is older than last.ckpt; delete it and re-run"
+      failed+=("$name k=$k (stale result)"); continue
+    elif [[ -f "$result" ]]; then
       echo "  eval: already done"; skipped+=("$name k=$k")
     elif [[ ! -f "$OUT/$name/checkpoints/last.ckpt" ]]; then
       echo "  no checkpoint in $OUT/$name; skipping"; failed+=("$name (no checkpoint)"); continue
@@ -122,7 +134,10 @@ print(f"{row} {m['n1_mert']:9.4f} {m['recall_at_5']:9.4f} {m['m2m_mert']:9.4f} "
 PY
   done
 done
-echo "ran: ${#ran[@]}  already done: ${#skipped[@]}  failed: ${#failed[@]}"
+echo "ran: ${#ran[@]}  already done: ${#skipped[@]}  not finished: ${#pending[@]}  failed: ${#failed[@]}"
+if [[ ${#pending[@]} -gt 0 ]]; then
+  printf '  not finished training (re-run later): %s\n' "${pending[@]}"
+fi
 if [[ ${#failed[@]} -gt 0 ]]; then
   printf '  failed: %s\n' "${failed[@]}"
   exit 1

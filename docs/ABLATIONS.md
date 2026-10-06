@@ -112,6 +112,20 @@ finished work, and continue with the next run when one fails. Run them inside
 tmux; each prints its usage with `--help`. Commands in this document run from
 the repository root.
 
+**Evaluating while training runs.** The evaluation runners (ablations 1-3 and
+the model studies) only evaluate runs that have **finished training**, so
+they can run on another GPU while training continues. `last.ckpt` alone does
+not count, because training rewrites it every 500 steps. A run is finished
+when it has a `runs.csv` row (written at the very end) or, for runs from
+before `runs.csv`, a `step-20000.ckpt`. Unfinished runs are listed as
+"not finished" and skipped without an error; re-run the same command later.
+For training curves, a `step-<K>.ckpt` is evaluated once training has saved a
+later checkpoint. An existing result that was evaluated before its run
+finished, or that is older than its checkpoint, is reported as **STALE** and
+counted as failed instead of being reused; delete it and re-run. The checks
+are `run_is_finished`, `checkpoint_is_settled`, and `result_is_stale` in
+`common.sh`.
+
 | Script | Ablation | Purpose |
 |---|---|---|
 | `train_history_cond_mpd.sh <gpu> <seed>...` | 1 | Train the four MPD conditioning variants |
@@ -567,6 +581,8 @@ All changes are on branch `waikei-ablation`, on top of `aa65657` (merge of
 | `023bd0d` | 2026-10-04 | Ablation 2: random cue table, cue-budget runners, evaluation timing, this document renamed to `ABLATIONS.md` |
 | `ec97ffd` | 2026-10-04 | Ablation 3: loss-schedule switch, gradient-norm logging, curve evaluation (raw weights, test subset), schedule runners, curve export |
 | `aa1e646` | 2026-10-05 | Fix: gradient-norm logging crashed under DDP |
+| `1a1a582` | 2026-10-06 | Model studies A and B1 (see [`model_study.md`](model_study.md#code-changes)) |
+| *(finished-run check commit)* | 2026-10-06 | Evaluation runners only evaluate finished runs and flag stale results |
 
 ### Commit `3d98434`: history-condition ablation
 
@@ -805,6 +821,34 @@ on one GPU, and the hook logged `train/grad_clipped` as a CPU tensor with
   holds the same values and syncing them again was unnecessary.
 - Runs without `GENPLAYLIST_LOG_GRAD_NORM=true`, including every ablation 1
   and 2 run, never reached this code and were not affected.
+
+### Finished-run check commit
+
+Before this change, the evaluation runners treated a model as ready as soon
+as `checkpoints/last.ckpt` existed. Training writes that file every 500 steps,
+so evaluating during training could score a half-trained model, write it as
+the official result, and later skip the finished model as "already done".
+
+- **`scripts/ablation/common.sh`:** new `FINAL_STEP` (20000),
+  `run_is_finished <name>` (a `runs.csv` row, or `step-$FINAL_STEP.ckpt`),
+  `checkpoint_is_settled <name> <K>` (the run is finished or a checkpoint
+  later than step K exists), and `result_is_stale <result> <checkpoint>`
+  (the result file is older than the checkpoint).
+- **`eval_history_cond.sh`, `eval_cue_budget.sh`, `eval_training_schedule.sh`,
+  `scripts/model_study/eval_history_length.sh`, and `eval_sampling_steps.sh`:**
+  - unfinished runs are skipped and listed as "not finished" (not an error)
+  - in curve mode, `step-<K>.ckpt` is used only once it is settled
+  - a result written before its run finished, or older than its checkpoint,
+    is reported as STALE and counted as failed
+  - the summary line adds a "not finished" count
+- `eval_history_cond.sh` now sources `common.sh` for these functions; its own
+  settings are unchanged.
+
+Tested against fake runs: finished (with a `runs.csv` row), finished from
+before `runs.csv` (only `step-20000.ckpt`), still training, never started,
+evaluated mid-training, and a finished run with an older result, plus curve
+points of a run still at step 7,500. Finished runs and settled checkpoints are
+evaluated as before; nothing else in the runners changed.
 
 ### What did not change
 

@@ -23,7 +23,12 @@ ablation** (8 ranked cues, `history_condition=full`, warm-up loss schedule),
 | Music4All v3-u500 | `ablation-history-cond/m4a-full-seed1`, `-seed2`, `-seed3` | `data/processed/ablation-m4a-v3-u500-8cue-full` |
 
 The runners find these through `cue_budget_variant 8` in `common.sh`, which
-also handles the unsuffixed MPD seed-1 folder.
+also handles the unsuffixed MPD seed-1 folder. Like the ablation evaluation
+runners, they only evaluate models that have finished training (a `runs.csv`
+row or `step-20000.ckpt`): unfinished ones are listed as "not finished" and
+skipped, and results evaluated before their model finished are reported as
+STALE. See "Evaluating while training runs" in
+[`ABLATIONS.md`](ABLATIONS.md#runner-scripts-scriptsablation).
 
 ## Study A: available history
 
@@ -175,8 +180,8 @@ that keeps most of the 256-step quality.
 | `src/03_backbone_recommender/configs/config.yaml` | `eval.history_length: null`. |
 | `src/03_backbone_recommender/scripts/eval_spotify.sh` | New `GENPLAYLIST_EVAL_HISTORY_LENGTH` (1-15). For k < 15 it passes `eval.history_length` and adds `-hist<k>` to the result file name; k = 15 adds nothing. It needs no protocol override and combines with the curve options. The test-subset arguments are now appended to the curve arguments instead of replacing them. |
 | `src/03_backbone_recommender/test_evaluation_protocol.py` | +2 tests: only the oldest blocks' RVQ, conflict, and cue positions are blanked, never BOI or the kept blocks; k = 15 blanks nothing, k = 1 blanks 14 blocks, a 0-cue layout has no cue positions, and k outside 1-15 is rejected. |
-| `scripts/model_study/eval_history_length.sh` | Runner for study A. |
-| `scripts/model_study/eval_sampling_steps.sh` | Runner for study B1. |
+| `scripts/model_study/eval_history_length.sh` | Runner for study A. Since the finished-run check commit, it evaluates only finished models and flags stale results. |
+| `scripts/model_study/eval_sampling_steps.sh` | Runner for study B1. Same finished-run check. |
 
 No fingerprinted preparation code changed, so every prepared folder stays
 valid. Training is untouched.

@@ -104,6 +104,36 @@ training_schedule_variant() {
   RUN_PREFIX=ablation-training-schedule/$DATASET-$SCHEDULE
 }
 
+# Evaluation must only read finished training runs. last.ckpt is not enough:
+# training rewrites it every 500 steps. A run is finished when training wrote
+# its runs.csv row (named runs) or its final step checkpoint (runs from before
+# runs.csv, e.g. the moved MPD seed-1 runs).
+FINAL_STEP=20000
+run_is_finished() {
+  local name=$1
+  grep -qF ",$name," "$OUT/runs.csv" 2>/dev/null && return 0
+  [[ -f "$OUT/$name/checkpoints/step-$FINAL_STEP.ckpt" ]]
+}
+
+# step-<K>.ckpt is written once; it is complete when the run has finished or
+# training has already saved a later checkpoint.
+checkpoint_is_settled() {
+  local name=$1 step=$2 file saved
+  run_is_finished "$name" && return 0
+  for file in "$OUT/$name"/checkpoints/step-*.ckpt; do
+    saved=${file##*/step-}
+    saved=${saved%.ckpt}
+    [[ "$saved" =~ ^[0-9]+$ ]] && (( saved > step )) && return 0
+  done
+  return 1
+}
+
+# A result older than its checkpoint was evaluated before training finished
+# (or before the checkpoint was replaced) and must not be reused.
+result_is_stale() {
+  [[ -f "$1" && -f "$2" && "$1" -ot "$2" ]]
+}
+
 ablation_env_is_clean() {
   if env | grep -q '^GENPLAYLIST_'; then
     echo "Unset these first:" >&2
