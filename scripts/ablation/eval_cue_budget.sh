@@ -3,21 +3,25 @@
 # eval + MERT metrics) and print a summary with the cost of each budget.
 #
 # Usage:  bash scripts/ablation/eval_cue_budget.sh <mpd|m4a> --gpu N [--seeds "1 2 3"]
-#                    [--budgets "0 4 8 random8 16"] [--no-mert] [--dry-run]
+#                    [--budgets "0 4 8 random8 16"] [--balanced] [--no-mert] [--dry-run]
 #   e.g.  bash scripts/ablation/eval_cue_budget.sh mpd --gpu 4 --seeds "1 2 3"
 #         bash scripts/ablation/eval_cue_budget.sh m4a --gpu 7 --budgets "8 random8" --dry-run
+#         bash scripts/ablation/eval_cue_budget.sh mpd --gpu 4 --balanced
 #
 # Budget 8 (ranked top 8) is the history-conditioning Full model
 # (ablation-history-cond/<ds>-full-seed<N>, MPD seed 1: mpd-full); its result
-# is reused when it already exists. Finished evaluations and MERT outputs are
-# skipped, so re-running is safe. See docs/ABLATIONS.md.
+# is reused when it already exists. --balanced evaluates ablation 2b: 4 and 16
+# cues from outputs/ablation-cue-budget-balanced/, next to the reused 0, 8, and
+# random8 models; add 8noloss to --budgets for that control. Finished
+# evaluations and MERT outputs are skipped, so re-running is safe. See
+# docs/ABLATIONS.md.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO/scripts/ablation/common.sh"
 RESULT_FILE=last-steps256-evalseed1.json
 
-[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 ablation_dataset "${1:-}" || exit 2
 shift
 GPU=""; SEEDS="1"; BUDGETS="$CUE_BUDGETS_ALL"; RUN_MERT=true; DRY_RUN=false
@@ -26,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --gpu) GPU="${2:-}"; shift 2 ;;
     --seeds) SEEDS="${2:-}"; shift 2 ;;
     --budgets) BUDGETS="${2:-}"; shift 2 ;;
+    --balanced) CUE_LOSS=balanced; shift ;;
     --no-mert) RUN_MERT=false; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -104,17 +109,19 @@ for seed in $SEEDS; do
 done
 
 echo
-echo "=== Summary ($DATASET cue budget)"
-printf '%-8s %-5s %6s %9s %9s %9s %9s %9s\n' budget seed tokens N1-MERT Recall@5 M2M-MERT Cov@5 s/history
+echo "=== Summary ($DATASET cue budget, $CUE_LOSS cue loss)"
+printf '%-8s %-5s %6s %6s %9s %9s %9s %9s %9s\n' budget seed tokens cue_w N1-MERT Recall@5 M2M-MERT Cov@5 s/history
 for seed in $SEEDS; do
   for budget in $BUDGETS; do
     cue_budget_variant "$budget"
     result=$OUT/$(cue_budget_run_name "$seed")/results/$RESULT_FILE
-    python - "$result" "${result%.json}-mert.json" "$budget" "$seed" "$TOKENS" <<'PY'
+    cue_weight=${CUE_WEIGHT:-1.0}
+    [[ "$ACTIVE_CUES" == 0 ]] && cue_weight=-
+    python - "$result" "${result%.json}-mert.json" "$budget" "$seed" "$TOKENS" "$cue_weight" <<'PY'
 import json, sys
 from pathlib import Path
-result, mert, budget, seed, tokens = sys.argv[1:]
-row = f"{budget:<8} {seed:<5} {tokens:>6}"
+result, mert, budget, seed, tokens, cue_weight = sys.argv[1:]
+row = f"{budget:<8} {seed:<5} {tokens:>6} {cue_weight:>6}"
 if not Path(mert).is_file():
     print(f"{row}  (no MERT result)")
     raise SystemExit

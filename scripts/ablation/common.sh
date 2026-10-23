@@ -2,7 +2,7 @@
 #
 # Expects REPO. Provides:
 #   ablation_dataset <mpd|m4a>     dataset paths (DATA_CONFIG, DATA_ROOT, ...)
-#   cue_budget_variant <budget>    one cue-budget variant (ACTIVE_CUES, ...)
+#   cue_budget_variant <budget>    one cue-budget variant under CUE_LOSS (ACTIVE_CUES, ...)
 #   training_schedule_variant <s>  one loss schedule (warmup, fixed, uniform)
 #   ablation_env_is_clean          refuse leftover GENPLAYLIST_* variables
 
@@ -39,35 +39,77 @@ ablation_dataset() {
   RANDOM_CUE_ROOT=$REPO/data/processed/cues-$DATASET-random8-seed$RANDOM_CUE_SEED
 }
 
-# Sets, for one cue budget of the current dataset:
+# Cue-loss setting of the cue-budget ablation (set by --balanced):
+#   standard  every cue token weighs 1.0, so the cue share of the loss grows
+#             with the budget (44% at 4 cues, 62% at 8, 76% at 16)
+#   balanced  the cues of a song weigh 8 in total (1.0 x 8 / budget each), so
+#             every budget keeps the 8-cue share. 0, 8, and random8 already
+#             have it and reuse their standard models; 8noloss (8 cues as input
+#             only, cue weight 0) is an extra control.
+CUE_LOSS=standard
+CUE_BUDGETS_BALANCED="0 4 8 random8 16 8noloss"
+
+# Sets, for one cue budget of the current dataset and CUE_LOSS:
 #   ACTIVE_CUES  VARIANT_CUE_ROOT  PREPARED  TOKENS (per sequence)
 #   RUN_PREFIX   model folder under $OUT without the seed suffix
+#   CUE_WEIGHT  CUE_WARMUP_INITIAL  cue loss weights ("" = train_spotify.sh default)
+#   TRAINED_BY   empty when this runner trains the model, else where it comes from
 # Budget 8 (ranked top 8) is the history-conditioning Full model and its data.
 cue_budget_variant() {
   local budget=$1
   VARIANT_CUE_ROOT=$CUE_ROOT
-  case "$budget" in
-    0|4|16)
+  CUE_WEIGHT=""
+  CUE_WARMUP_INITIAL=""
+  TRAINED_BY=""
+  case "$CUE_LOSS:$budget" in
+    standard:0|standard:4|standard:16|balanced:0)
       ACTIVE_CUES=$budget
       PREPARED=$PREPARED_PREFIX-cues$budget
       RUN_PREFIX=ablation-cue-budget/$DATASET-cues$budget
       ;;
-    8)
+    standard:8|balanced:8)
       ACTIVE_CUES=8
       PREPARED=$PREPARED_PREFIX-8cue-full
       RUN_PREFIX=ablation-history-cond/$DATASET-full
+      TRAINED_BY="train_history_cond_$DATASET.sh"
       ;;
-    random8)
+    standard:random8|balanced:random8)
       ACTIVE_CUES=8
       VARIANT_CUE_ROOT=$RANDOM_CUE_ROOT
       PREPARED=$PREPARED_PREFIX-cues8random
       RUN_PREFIX=ablation-cue-budget/$DATASET-cues8random
       ;;
+    balanced:4)
+      ACTIVE_CUES=4
+      PREPARED=$PREPARED_PREFIX-cues4
+      RUN_PREFIX=ablation-cue-budget-balanced/$DATASET-cues4
+      CUE_WEIGHT=2.0
+      CUE_WARMUP_INITIAL=0.2
+      ;;
+    balanced:16)
+      ACTIVE_CUES=16
+      PREPARED=$PREPARED_PREFIX-cues16
+      RUN_PREFIX=ablation-cue-budget-balanced/$DATASET-cues16
+      CUE_WEIGHT=0.5
+      CUE_WARMUP_INITIAL=0.05
+      ;;
+    balanced:8noloss)
+      ACTIVE_CUES=8
+      PREPARED=$PREPARED_PREFIX-8cue-full
+      RUN_PREFIX=ablation-cue-budget-balanced/$DATASET-cues8noloss
+      CUE_WEIGHT=0.0
+      CUE_WARMUP_INITIAL=0.0
+      ;;
     *)
-      echo "Unknown cue budget: $budget (use: $CUE_BUDGETS_ALL)" >&2
+      local valid=$CUE_BUDGETS_ALL
+      [[ "$CUE_LOSS" == balanced ]] && valid=$CUE_BUDGETS_BALANCED
+      echo "Unknown $CUE_LOSS cue budget: $budget (use: $valid)" >&2
       return 2
       ;;
   esac
+  if [[ "$CUE_LOSS" == balanced && -z "$CUE_WEIGHT" && -z "$TRAINED_BY" ]]; then
+    TRAINED_BY="train_cue_budget.sh $DATASET (standard; same cue-loss share)"
+  fi
   TOKENS=$((2 + 20 * (5 + ACTIVE_CUES)))
 }
 

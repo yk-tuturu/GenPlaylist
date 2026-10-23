@@ -2,13 +2,19 @@
 # Cue-budget ablation: train one dataset's cue-budget variants for given seeds.
 #
 # Usage:  bash scripts/ablation/train_cue_budget.sh <mpd|m4a> --gpu N --seeds "1 2 3"
-#                                                   [--budgets "0 4 random8 16"]
+#                                                   [--budgets "0 4 random8 16"] [--balanced]
 #   e.g.  bash scripts/ablation/train_cue_budget.sh mpd --gpu 4 --seeds 1
 #         bash scripts/ablation/train_cue_budget.sh m4a --gpu 7 --seeds "2 3" --budgets "16"
+#         bash scripts/ablation/train_cue_budget.sh mpd --gpu 4 --seeds 1 --balanced
 #
 # Runs go to outputs/ablation-cue-budget/<mpd|m4a>-cues<N>-seed<S> (random-8:
 # -cues8random-) and are logged in outputs/runs.csv. Budget 8 (ranked top 8)
 # is the history-conditioning Full model and is never retrained here.
+# --balanced (ablation 2b) keeps the cue share of the loss at its 8-cue value:
+# it trains 4 and 16 cues with cue weight 8/budget into
+# outputs/ablation-cue-budget-balanced/, plus budget 8noloss (8 cues as input
+# only) when listed; default budgets "4 16". 0, 8, and random8 already have
+# the 8-cue share and are reused, not retrained.
 # Finished runs are refused by train_spotify.sh and skipped. Run
 # prepare_cue_budget.sh first. See docs/ABLATIONS.md.
 set -uo pipefail
@@ -16,18 +22,22 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO/scripts/ablation/common.sh"
 
-[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 ablation_dataset "${1:-}" || exit 2
 shift
-GPU=""; SEEDS=""; BUDGETS="0 4 random8 16"
+GPU=""; SEEDS=""; BUDGETS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --gpu) GPU="${2:-}"; shift 2 ;;
     --seeds) SEEDS="${2:-}"; shift 2 ;;
     --budgets) BUDGETS="${2:-}"; shift 2 ;;
+    --balanced) CUE_LOSS=balanced; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+if [[ -z "$BUDGETS" ]]; then
+  if [[ "$CUE_LOSS" == balanced ]]; then BUDGETS="4 16"; else BUDGETS="0 4 random8 16"; fi
+fi
 [[ -n "$GPU" && -n "$SEEDS" ]] || { echo "--gpu and --seeds are required" >&2; exit 2; }
 for seed in $SEEDS; do
   [[ "$seed" =~ ^[0-9]+$ ]] || { echo "Seed must be a number: $seed" >&2; exit 2; }
@@ -38,7 +48,7 @@ ablation_env_is_clean || exit 2
 missing=false
 for budget in $BUDGETS; do
   cue_budget_variant "$budget" || exit 2
-  [[ "$budget" == 8 ]] && continue
+  [[ -n "$TRAINED_BY" ]] && continue
   for f in "$PREPARED/prepared_manifest.json" "$VARIANT_CUE_ROOT/item2cues.json"; do
     [[ -f "$f" ]] || { echo "Missing ($budget): $f" >&2; missing=true; }
   done
@@ -49,12 +59,19 @@ failed=()
 for seed in $SEEDS; do
   for budget in $BUDGETS; do
     cue_budget_variant "$budget"
-    if [[ "$budget" == 8 ]]; then
-      echo "=== budget 8 (ranked) is the history-conditioning Full model; train it with train_history_cond_$DATASET.sh"
+    if [[ -n "$TRAINED_BY" ]]; then
+      echo "=== budget $budget is not trained here; it is the model from $TRAINED_BY"
       continue
     fi
     NAME=$RUN_PREFIX-seed$seed
-    echo "=== $(date '+%F %T')  $NAME  ($ACTIVE_CUES cues, $TOKENS tokens, GPU $GPU)"
+    echo "=== $(date '+%F %T')  $NAME  ($ACTIVE_CUES cues, $TOKENS tokens, cue weight ${CUE_WEIGHT:-default}, GPU $GPU)"
+    # Balanced budgets set their own cue loss weights; otherwise
+    # train_spotify.sh keeps its defaults.
+    weight_env=()
+    if [[ -n "$CUE_WEIGHT" ]]; then
+      weight_env=(GENPLAYLIST_CUE_WEIGHT=$CUE_WEIGHT
+                  GENPLAYLIST_CUE_WARMUP_INITIAL_WEIGHT=$CUE_WARMUP_INITIAL)
+    fi
     # runs.csv only gets a row when training finishes, so a checkpoint without
     # a row is a crashed run: resume it in place.
     MODE=warmstart
@@ -66,6 +83,7 @@ for seed in $SEEDS; do
       echo "  unfinished run found; resuming"
       MODE=resume
     fi
+    env ${weight_env[@]+"${weight_env[@]}"} \
     CUDA_VISIBLE_DEVICES=$GPU \
     GENPLAYLIST_TRAIN_MODE=$MODE \
     GENPLAYLIST_DATA_CONFIG=$DATA_CONFIG \
