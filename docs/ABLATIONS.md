@@ -451,7 +451,10 @@ bash scripts/ablation/train_cue_budget.sh mpd --gpu 4 --seeds 1 --balanced --bud
 bash scripts/ablation/eval_cue_budget.sh mpd --gpu 4 --seeds 1 --balanced --budgets "0 4 8 random8 16 8noloss"
 ```
 
-The same commands with `m4a` run Music4All. Compare 4, 8, and 16: if they
+The same commands with `m4a` run Music4All. On a shared GPU, add
+`--train-batch-size 64` (or 32) to the training command: the global batch
+stays 512 through gradient accumulation, so only memory and speed change.
+Compare 4, 8, and 16: if they
 are now level, ablation 2's decline was a loss-balance effect. Also check that
 the unweighted RVQ losses (`train/layer_nll/d0`-`d2`) end level across them.
 
